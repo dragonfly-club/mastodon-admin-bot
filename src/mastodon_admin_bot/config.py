@@ -1,7 +1,8 @@
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _parse_int_set(value: str | set[int]) -> set[int]:
@@ -36,11 +37,11 @@ class Settings(BaseSettings):
         alias="MASTODON_SCOPES",
     )
 
-    trusted_telegram_user_ids: set[int] = Field(
+    trusted_telegram_user_ids: Annotated[set[int], NoDecode] = Field(
         default_factory=set,
         alias="TRUSTED_TELEGRAM_USER_IDS",
     )
-    telegram_home_chat_ids: set[int] = Field(
+    telegram_home_chat_ids: Annotated[set[int], NoDecode] = Field(
         default_factory=set,
         alias="TELEGRAM_HOME_CHAT_IDS",
     )
