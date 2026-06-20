@@ -58,15 +58,9 @@ docker build -t mastodon-admin-bot .
 docker volume create mastodon-admin-bot-data
 docker run \
   --env-file .env \
-  -e DATABASE_URL=sqlite+aiosqlite:////home/app/bot.db \
-  -v mastodon-admin-bot-data:/home/app \
+  -v mastodon-admin-bot-data:/data \
   -p 8080:8080 \
   mastodon-admin-bot
 ```
 
 The image listens on `BIND_PORT`, defaulting to `8080`, and binds to `0.0.0.0` inside the container.
-The application runs from `/app`, so mounting the named volume at `/home/app`
-does not hide application files. The volume keeps the SQLite database outside
-the container filesystem, so it survives container removal and recreation. If
-you use a host bind mount instead of a named volume, make sure the mounted
-directory is writable by the container's `app` user.

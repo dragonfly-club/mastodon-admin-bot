@@ -20,17 +20,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     BIND_HOST=0.0.0.0 \
-    BIND_PORT=8080
+    BIND_PORT=8080 \
+    DATABASE_URL=sqlite+aiosqlite:////data/bot.db
 
 WORKDIR /app
 
-RUN useradd --create-home --shell /usr/sbin/nologin app
-
-COPY --from=builder --chown=app:app /app/.venv /app/.venv
-COPY --chown=app:app alembic.ini ./alembic.ini
-COPY --chown=app:app migrations ./migrations
-
-USER app
+COPY --from=builder /app/.venv /app/.venv
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
 
 EXPOSE 8080
 
