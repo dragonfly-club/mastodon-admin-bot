@@ -92,11 +92,13 @@ def test_webhook_object_type_is_limited_to_accounts_and_reports() -> None:
     assert _object_type_for_event("status.created") is None
 
 
-def test_new_message_policy_waits_for_confirmed_accounts() -> None:
+def test_new_message_policy_sends_pending_account_created() -> None:
     assert _should_send_new_message("report.created", {"id": "1"})
-    assert _should_send_new_message("account.created", {"id": "1", "confirmed": True})
-    assert not _should_send_new_message("account.created", {"id": "1", "confirmed": False})
-    assert _should_send_new_message("account.updated", {"id": "1", "confirmed": True})
+    assert _should_send_new_message("account.created", {"id": "1", "approved": False})
+    assert _should_send_new_message("account.created", {"id": "1", "approved": None})
+    assert not _should_send_new_message("account.created", {"id": "1", "approved": True})
+    assert not _should_send_new_message("account.updated", {"id": "1", "approved": False})
+    assert not _should_send_new_message("account.approved", {"id": "1", "approved": True})
     assert not _should_send_new_message("report.updated", {"id": "1"})
 
 

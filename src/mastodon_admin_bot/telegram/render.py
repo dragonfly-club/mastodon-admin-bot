@@ -38,7 +38,6 @@ def render_account_event(event: str, account: dict[str, Any]) -> str:
         f"Account: {admin_account_link(account)}",
         f"ID: {hcode(str(account.get('id', 'unknown')))}",
         f"Email: {escape(str(email))}",
-        f"Confirmed: {_yes_no(account.get('confirmed'))}",
         f"Approved: {_yes_no(account.get('approved'))}",
         f"IP: {escape(str(ip))}",
         f"Locale: {escape(str(locale))}",

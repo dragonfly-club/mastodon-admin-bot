@@ -254,8 +254,8 @@ def _object_type_for_event(event_name: str) -> str | None:
 def _should_send_new_message(event_name: str, obj: dict[str, Any]) -> bool:
     if event_name == "report.created":
         return True
-    if event_name in {"account.created", "account.approved", "account.updated"}:
-        return obj.get("confirmed") is True
+    if event_name == "account.created":
+        return obj.get("approved") is not True
     return False
 
 

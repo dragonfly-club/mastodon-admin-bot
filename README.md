@@ -47,9 +47,9 @@ uv run alembic upgrade head
 
 Webhook messages are deduplicated by Mastodon object ID: report webhooks by
 report ID, and account webhooks by account ID. The bot sends new Telegram
-messages only for new reports and confirmed accounts. Later webhooks for the
-same object edit the existing Telegram message when a mapping exists; otherwise
-they are ignored.
+messages only for new reports and new pending account registrations. Later
+webhooks for the same object edit the existing Telegram message when a mapping
+exists; otherwise they are ignored.
 
 ## Docker
 
