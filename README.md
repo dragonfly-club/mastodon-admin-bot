@@ -47,7 +47,7 @@ uv run alembic upgrade head
 
 Webhook messages are deduplicated by Mastodon object ID: report webhooks by
 report ID, and account webhooks by account ID. The bot sends new Telegram
-messages only for `report.created` and pending local `account.created` events.
+messages only for `report.created` and local `account.created` events.
 Other webhook events, including `report.updated`, `account.updated`, and
 `account.approved`, are ignored. Moderation actions taken from Telegram update
 the clicked message; matching messages in other configured chats have their
