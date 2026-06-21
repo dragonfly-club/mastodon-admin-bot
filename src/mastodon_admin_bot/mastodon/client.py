@@ -82,23 +82,9 @@ class MastodonClient:
         )
         return self._json_or_error(response)
 
-    async def assign_report_to_self(self, report_id: str) -> dict[str, Any]:
-        response = await self.client.post(
-            f"/api/v1/admin/reports/{report_id}/assign_to_self",
-            headers=self._headers(),
-        )
-        return self._json_or_error(response)
-
     async def resolve_report(self, report_id: str) -> dict[str, Any]:
         response = await self.client.post(
             f"/api/v1/admin/reports/{report_id}/resolve",
-            headers=self._headers(),
-        )
-        return self._json_or_error(response)
-
-    async def reopen_report(self, report_id: str) -> dict[str, Any]:
-        response = await self.client.post(
-            f"/api/v1/admin/reports/{report_id}/reopen",
             headers=self._headers(),
         )
         return self._json_or_error(response)

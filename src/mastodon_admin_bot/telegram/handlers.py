@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from html import escape
-from typing import Any
 from urllib.parse import urlencode
 
 import httpx
 from aiogram import Bot, Router
 from aiogram.enums import ChatType, ParseMode
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InaccessibleMessage, Message
 
 from mastodon_admin_bot.config import Settings
+from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.security import make_state
 from mastodon_admin_bot.storage.repository import Repository
@@ -21,9 +21,16 @@ from mastodon_admin_bot.storage.repository import Repository
 from .keyboards import Action, AdminCallback
 
 logger = logging.getLogger(__name__)
+_ACTION_LOCKS = KeyedAsyncLocks()
+_HANDLED_ACTION_KEYS: set[str] = set()
 
 
-def build_router(settings: Settings, repository: Repository) -> Router:
+def build_router(
+    settings: Settings,
+    repository: Repository,
+    action_locks: KeyedAsyncLocks = _ACTION_LOCKS,
+    handled_action_keys: set[str] = _HANDLED_ACTION_KEYS,
+) -> Router:
     router = Router(name=__name__)
 
     def is_trusted_user(user_id: int | None) -> bool:
@@ -92,52 +99,51 @@ def build_router(settings: Settings, repository: Repository) -> Router:
             await query.answer("Run /link first.", show_alert=True)
             return
         token, mastodon_username = token_data
-        webhook_event = await repository.get_webhook_event(callback_data.event_id)
-        if webhook_event is None:
-            await query.answer("This moderation event no longer exists.", show_alert=True)
-            return
-        payload = json.loads(webhook_event.raw_payload)
-        if not isinstance(payload, dict) or not _callback_matches_event(callback_data, payload):
-            await query.answer("This action does not match the original event.", show_alert=True)
-            return
-
-        lock_key = _action_lock_key(callback_data)
-        object_type, action_object_id = _action_object(callback_data)
-        action = await repository.try_create_action(
-            event_id=callback_data.event_id,
-            lock_key=lock_key,
-            action_type=callback_data.action.value,
-            object_type=object_type,
-            object_id=action_object_id,
-            telegram_user_id=user_id,
-            mastodon_username=mastodon_username,
-        )
-        if action is None:
-            await query.answer("That moderation decision was already handled.", show_alert=True)
-            return
 
         async def execute_action() -> None:
             async with MastodonClient(settings.mastodon_origin, token=token) as client:
                 await _execute_action(client, callback_data)
 
-        error_message = await _run_action_with_lock_cleanup(repository, action.id, execute_action)
+        error_message = await _run_locked_action(
+            action_locks,
+            handled_action_keys,
+            _action_lock_key(callback_data),
+            execute_action,
+        )
         if error_message is not None:
             await query.answer(error_message, show_alert=True)
             return
 
-        await repository.mark_action_success(action.id)
         await query.answer("Done.")
         if query.message and not isinstance(query.message, InaccessibleMessage):
             suffix = _handled_suffix(mastodon_username, callback_data.action)
             current_text = query.message.html_text or query.message.text or ""
-            await bot.edit_message_text(
+            await _mark_current_message_handled(
+                bot=bot,
                 chat_id=query.message.chat.id,
                 message_id=query.message.message_id,
                 text=f"{current_text}{suffix}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=None,
-                disable_web_page_preview=True,
             )
+            for mapping in await repository.get_message_mappings(
+                object_type=_callback_mapping_object_type(callback_data),
+                object_id=callback_data.object_id,
+            ):
+                if (
+                    mapping.chat_id == query.message.chat.id
+                    and mapping.message_id == query.message.message_id
+                ):
+                    continue
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=mapping.chat_id,
+                        message_id=mapping.message_id,
+                        reply_markup=None,
+                    )
+                except TelegramAPIError:
+                    logger.warning(
+                        "Failed to remove moderation keyboard",
+                        extra={"chat_id": mapping.chat_id, "message_id": mapping.message_id},
+                    )
 
     async def _execute_action(client: MastodonClient, callback_data: AdminCallback) -> None:
         match callback_data.action:
@@ -145,13 +151,9 @@ def build_router(settings: Settings, repository: Repository) -> Router:
                 await client.approve_account(callback_data.object_id)
             case Action.REJECT_ACCOUNT:
                 await client.reject_account(callback_data.object_id)
-            case Action.ASSIGN_REPORT:
-                await client.assign_report_to_self(callback_data.object_id)
             case Action.RESOLVE_REPORT:
                 await client.resolve_report(callback_data.object_id)
-            case Action.REOPEN_REPORT:
-                await client.reopen_report(callback_data.object_id)
-            case Action.SILENCE_TARGET:
+            case Action.LIMIT_TARGET:
                 if callback_data.target_id is None:
                     raise MastodonApiError(400, "missing target account id")
                 await client.account_action(
@@ -177,71 +179,100 @@ def _is_private_chat(chat_type: str | ChatType) -> bool:
     return chat_type == ChatType.PRIVATE
 
 
-async def _run_action_with_lock_cleanup(
-    repository: Repository,
-    action_id: int,
+async def _mark_current_message_handled(
+    *,
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+) -> None:
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
+    except TelegramAPIError as exc:
+        if _is_message_not_modified(exc):
+            return
+        logger.warning(
+            "Failed to mark moderation message handled",
+            extra={"chat_id": chat_id, "message_id": message_id},
+        )
+
+
+def _is_message_not_modified(exc: TelegramAPIError) -> bool:
+    return isinstance(exc, TelegramBadRequest) and "message is not modified" in exc.message.lower()
+
+
+async def _run_action(
     execute: Callable[[], Awaitable[None]],
 ) -> str | None:
     try:
         await execute()
     except MastodonApiError as exc:
-        await repository.mark_action_failed(action_id, exc.message)
         return f"Mastodon rejected action: {exc.message}"
-    except (httpx.HTTPError, ValueError, KeyError) as exc:
-        await repository.mark_action_failed(action_id, str(exc))
+    except (httpx.HTTPError, ValueError, KeyError):
         return "Mastodon action failed. Please retry."
-    except Exception as exc:
+    except Exception:
         logger.exception("Unexpected moderation action failure")
-        await repository.mark_action_failed(action_id, str(exc))
         return "Unexpected moderation action failure. Please retry."
     return None
 
 
+async def _run_locked_action(
+    locks: KeyedAsyncLocks,
+    handled_keys: set[str],
+    lock_key: str,
+    execute: Callable[[], Awaitable[None]],
+) -> str | None:
+    lock = await locks.try_acquire(lock_key)
+    if lock is None:
+        return "That moderation decision is already being handled."
+    async with lock:
+        if lock_key in handled_keys:
+            return "That moderation decision was already handled."
+        error_message = await _run_action(execute)
+        if error_message is None:
+            handled_keys.add(lock_key)
+        return error_message
+
+
 def _handled_suffix(mastodon_username: str, action: Action) -> str:
-    return f"\n\nHandled by {escape(mastodon_username)}: {action.value}"
+    return f"\n\nHandled by {escape(mastodon_username)}: {_action_label(action)}"
 
 
-def _callback_matches_event(callback_data: AdminCallback, payload: dict[str, Any]) -> bool:
-    event = payload.get("event")
-    obj = payload.get("object")
-    if not isinstance(event, str) or not isinstance(obj, dict):
-        return False
+def _action_label(action: Action) -> str:
+    match action:
+        case Action.APPROVE_ACCOUNT:
+            return "Approved account"
+        case Action.REJECT_ACCOUNT:
+            return "Rejected account"
+        case Action.RESOLVE_REPORT:
+            return "Resolved report"
+        case Action.LIMIT_TARGET:
+            return "Limited target account"
+        case Action.SUSPEND_TARGET:
+            return "Suspended target account"
+
+
+def _callback_mapping_object_type(callback_data: AdminCallback) -> str:
     match callback_data.action:
         case Action.APPROVE_ACCOUNT | Action.REJECT_ACCOUNT:
-            return event.startswith("account.") and str(obj.get("id")) == callback_data.object_id
-        case Action.ASSIGN_REPORT | Action.RESOLVE_REPORT | Action.REOPEN_REPORT:
-            return event.startswith("report.") and str(obj.get("id")) == callback_data.object_id
-        case Action.SILENCE_TARGET | Action.SUSPEND_TARGET:
-            target = obj.get("target_account")
-            target_id = (
-                str(target.get("id")) if isinstance(target, dict) and target.get("id") else None
-            )
-            return (
-                event.startswith("report.")
-                and str(obj.get("id")) == callback_data.object_id
-                and target_id == callback_data.target_id
-            )
+            return "account"
+        case Action.RESOLVE_REPORT | Action.LIMIT_TARGET | Action.SUSPEND_TARGET:
+            return "report"
 
 
 def _action_lock_key(callback_data: AdminCallback) -> str:
     match callback_data.action:
         case Action.APPROVE_ACCOUNT | Action.REJECT_ACCOUNT:
             return f"account_decision:{callback_data.object_id}"
-        case Action.ASSIGN_REPORT:
-            return f"report_assignment:{callback_data.object_id}"
-        case Action.RESOLVE_REPORT | Action.REOPEN_REPORT:
-            return f"report_state:{callback_data.object_id}:{callback_data.event_id}"
-        case Action.SILENCE_TARGET | Action.SUSPEND_TARGET:
-            return f"report_target_action:{callback_data.object_id}:{callback_data.target_id}"
-
-
-def _action_object(callback_data: AdminCallback) -> tuple[str, str]:
-    match callback_data.action:
-        case Action.APPROVE_ACCOUNT | Action.REJECT_ACCOUNT:
-            return "account", callback_data.object_id
-        case Action.ASSIGN_REPORT | Action.RESOLVE_REPORT | Action.REOPEN_REPORT:
-            return "report", callback_data.object_id
-        case Action.SILENCE_TARGET | Action.SUSPEND_TARGET:
-            if callback_data.target_id is None:
-                return "account", callback_data.object_id
-            return "account", callback_data.target_id
+        case Action.RESOLVE_REPORT:
+            return f"report_state:{callback_data.object_id}"
+        case Action.LIMIT_TARGET | Action.SUSPEND_TARGET:
+            target_id = callback_data.target_id or "unknown"
+            return f"report_target_action:{callback_data.object_id}:{target_id}"

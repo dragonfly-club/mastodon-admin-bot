@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import event, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -16,13 +15,10 @@ from sqlalchemy.ext.asyncio import (
 from mastodon_admin_bot.security import TokenCipher
 
 from .models import (
-    ActionLock,
-    ActionLog,
     Base,
     ModeratorLink,
     OAuthState,
-    TelegramDelivery,
-    WebhookEvent,
+    TelegramMessageMapping,
 )
 
 
@@ -37,10 +33,6 @@ def create_engine(database_url: str) -> AsyncEngine:
             cursor.close()
 
     return engine
-
-
-def _canonical_payload(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class Repository:
@@ -139,154 +131,70 @@ class Repository:
             link = await session.get(ModeratorLink, telegram_user_id)
             return link.mastodon_username if link else None
 
-    async def record_webhook_event(
+    async def get_message_mappings(
         self,
         *,
-        dedupe_key: str,
-        event_type: str,
-        object_id: str | None,
-        payload: dict[str, Any],
-        legacy_dedupe_key: str | None = None,
-    ) -> tuple[WebhookEvent, bool]:
-        raw_payload = _canonical_payload(payload)
+        object_type: str,
+        object_id: str,
+    ) -> list[TelegramMessageMapping]:
         async with self.sessionmaker() as session:
-            if legacy_dedupe_key is not None:
-                legacy = await session.scalar(
-                    select(WebhookEvent).where(WebhookEvent.dedupe_key == legacy_dedupe_key)
-                )
-                if (
-                    legacy is not None
-                    and _canonical_payload(json.loads(legacy.raw_payload)) == raw_payload
-                ):
-                    return legacy, False
-            event = WebhookEvent(
-                dedupe_key=dedupe_key,
-                event_type=event_type,
+            mappings = await session.scalars(
+                select(TelegramMessageMapping).where(
+                    TelegramMessageMapping.object_type == object_type,
+                    TelegramMessageMapping.object_id == object_id,
+                ).order_by(TelegramMessageMapping.chat_id)
+            )
+            return list(mappings)
+
+    async def get_message_mapping(
+        self,
+        *,
+        object_type: str,
+        object_id: str,
+        chat_id: int,
+    ) -> TelegramMessageMapping | None:
+        async with self.sessionmaker() as session:
+            return cast(
+                TelegramMessageMapping | None,
+                await session.scalar(
+                    select(TelegramMessageMapping).where(
+                        TelegramMessageMapping.object_type == object_type,
+                        TelegramMessageMapping.object_id == object_id,
+                        TelegramMessageMapping.chat_id == chat_id,
+                    )
+                ),
+            )
+
+    async def upsert_message_mapping(
+        self,
+        *,
+        object_type: str,
+        object_id: str,
+        chat_id: int,
+        message_id: int,
+    ) -> TelegramMessageMapping:
+        async with self.sessionmaker() as session:
+            mapping = TelegramMessageMapping(
+                object_type=object_type,
                 object_id=object_id,
-                raw_payload=raw_payload,
+                chat_id=chat_id,
+                message_id=message_id,
             )
-            session.add(event)
+            session.add(mapping)
             try:
                 await session.commit()
-                return event, True
+                return mapping
             except IntegrityError:
                 await session.rollback()
                 existing = await session.scalar(
-                    select(WebhookEvent).where(WebhookEvent.dedupe_key == dedupe_key)
-                )
-                if existing is None:
-                    raise
-                return existing, False
-
-    async def get_webhook_event(self, event_id: int) -> WebhookEvent | None:
-        async with self.sessionmaker() as session:
-            return await session.get(WebhookEvent, event_id)
-
-    async def get_pending_deliveries(self, event_id: int) -> list[TelegramDelivery]:
-        async with self.sessionmaker() as session:
-            result = await session.scalars(
-                select(TelegramDelivery).where(
-                    TelegramDelivery.event_id == event_id,
-                    TelegramDelivery.status != "sent",
-                )
-            )
-            return list(result)
-
-    async def ensure_delivery(self, event_id: int, chat_id: int) -> TelegramDelivery:
-        async with self.sessionmaker() as session:
-            delivery = TelegramDelivery(event_id=event_id, chat_id=chat_id)
-            session.add(delivery)
-            try:
-                await session.commit()
-                return delivery
-            except IntegrityError:
-                await session.rollback()
-                existing = await session.scalar(
-                    select(TelegramDelivery).where(
-                        TelegramDelivery.event_id == event_id,
-                        TelegramDelivery.chat_id == chat_id,
+                    select(TelegramMessageMapping).where(
+                        TelegramMessageMapping.object_type == object_type,
+                        TelegramMessageMapping.object_id == object_id,
+                        TelegramMessageMapping.chat_id == chat_id,
                     )
                 )
                 if existing is None:
                     raise
+                existing.message_id = message_id
+                await session.commit()
                 return existing
-
-    async def mark_delivery_sent(self, event_id: int, chat_id: int, message_id: int) -> None:
-        async with self.sessionmaker() as session:
-            delivery = await session.scalar(
-                select(TelegramDelivery).where(
-                    TelegramDelivery.event_id == event_id,
-                    TelegramDelivery.chat_id == chat_id,
-                )
-            )
-            if delivery is not None:
-                delivery.message_id = message_id
-                delivery.status = "sent"
-                delivery.error = None
-                await session.commit()
-
-    async def mark_delivery_failed(self, event_id: int, chat_id: int, error: str) -> None:
-        async with self.sessionmaker() as session:
-            delivery = await session.scalar(
-                select(TelegramDelivery).where(
-                    TelegramDelivery.event_id == event_id,
-                    TelegramDelivery.chat_id == chat_id,
-                )
-            )
-            if delivery is not None:
-                delivery.status = "failed"
-                delivery.error = error
-                await session.commit()
-
-    async def try_create_action(
-        self,
-        *,
-        event_id: int | None,
-        lock_key: str,
-        action_type: str,
-        object_type: str,
-        object_id: str,
-        telegram_user_id: int,
-        mastodon_username: str,
-    ) -> ActionLog | None:
-        async with self.sessionmaker() as session:
-            action = ActionLog(
-                event_id=event_id,
-                action_type=action_type,
-                object_type=object_type,
-                object_id=object_id,
-                telegram_user_id=telegram_user_id,
-                mastodon_username=mastodon_username,
-                status="pending",
-            )
-            session.add(action)
-            await session.flush()
-            session.add(ActionLock(lock_key=lock_key, action_log_id=action.id))
-            try:
-                await session.commit()
-                return action
-            except IntegrityError:
-                await session.rollback()
-                return None
-
-    async def mark_action_success(self, action_id: int) -> None:
-        async with self.sessionmaker() as session:
-            action = await session.get(ActionLog, action_id)
-            if action is not None:
-                action.status = "success"
-                action.error = None
-                await session.commit()
-
-    async def mark_action_failed(self, action_id: int, error: str) -> None:
-        async with self.sessionmaker() as session:
-            action = await session.get(ActionLog, action_id)
-            if action is None:
-                return
-            action.status = "failed"
-            action.error = error
-            lock = await session.scalar(
-                select(ActionLock).where(ActionLock.action_log_id == action_id)
-            )
-            if lock is not None:
-                await session.delete(lock)
-            await session.commit()

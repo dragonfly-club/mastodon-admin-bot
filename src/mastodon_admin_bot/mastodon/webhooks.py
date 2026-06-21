@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,17 +17,6 @@ class MastodonWebhook:
     def object_id(self) -> str | None:
         value = self.object.get("id")
         return str(value) if value is not None else None
-
-    @property
-    def dedupe_key(self) -> str:
-        canonical = json.dumps(self.payload, sort_keys=True, separators=(",", ":"))
-        return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
-
-    @property
-    def legacy_dedupe_key(self) -> str:
-        object_id = self.object_id or "none"
-        created = self.created_at or "unknown"
-        return f"{self.event}:{object_id}:{created}"
 
 
 def parse_webhook_payload(payload: dict[str, Any]) -> MastodonWebhook:

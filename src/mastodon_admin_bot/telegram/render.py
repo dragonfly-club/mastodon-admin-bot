@@ -9,7 +9,6 @@ from aiogram.utils.markdown import hbold, hcode
 from mastodon_admin_bot.mastodon.webhooks import (
     account_acct,
     account_url,
-    html_to_text,
     summarize_status,
 )
 
@@ -31,13 +30,19 @@ def render_account_event(event: str, account: dict[str, Any]) -> str:
     title = "New pending registration" if event == "account.created" else f"Mastodon {event}"
     invite_request = account.get("invite_request") or ""
     email = account.get("email") or "unknown"
+    ip = account.get("ip") or "unknown"
     locale = account.get("locale") or "unknown"
+    created_at = account.get("created_at") or "unknown"
     lines = [
         hbold(title),
         f"Account: {admin_account_link(account)}",
         f"ID: {hcode(str(account.get('id', 'unknown')))}",
         f"Email: {escape(str(email))}",
+        f"Confirmed: {_yes_no(account.get('confirmed'))}",
+        f"Approved: {_yes_no(account.get('approved'))}",
+        f"IP: {escape(str(ip))}",
         f"Locale: {escape(str(locale))}",
+        f"Created: {escape(str(created_at))}",
     ]
     if invite_request:
         lines.append(f"Reason: {escape(str(invite_request))}")
@@ -56,6 +61,8 @@ def render_report_event(report: dict[str, Any]) -> str:
     rules: list[Any] = raw_rules if isinstance(raw_rules, list) else []
     raw_statuses = report.get("statuses")
     statuses: list[Any] = raw_statuses if isinstance(raw_statuses, list) else []
+    action_taken = report.get("action_taken")
+    state = "resolved" if action_taken is True else "open"
 
     lines = [
         hbold("New Mastodon report"),
@@ -63,6 +70,7 @@ def render_report_event(report: dict[str, Any]) -> str:
         f"Reporter: {reporter}",
         f"Target: {target}",
         f"Category: {escape(category)}",
+        f"State: {escape(state)}",
     ]
     if comment:
         lines.append(f"Comment: {escape(comment)}")
@@ -81,10 +89,9 @@ def render_report_event(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_status_event(status: dict[str, Any], event: str) -> str:
-    content = html_to_text(str(status.get("content") or ""))
-    url = status.get("url") or status.get("uri")
-    lines = [hbold(f"Mastodon {event}"), escape(content or "<empty status>")]
-    if url:
-        lines.append(escape(str(url)))
-    return "\n".join(lines)
+def _yes_no(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "unknown"

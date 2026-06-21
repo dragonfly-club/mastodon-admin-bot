@@ -45,11 +45,11 @@ configured database on startup; for a manual upgrade, run:
 uv run alembic upgrade head
 ```
 
-Webhook retries are deduplicated by hashing the exact canonical JSON payload.
-This prevents exact retry deliveries from sending duplicate Telegram messages
-without suppressing distinct events that happen to share the same object ID and
-timestamp. Rows created by older versions using the legacy event/object/timestamp
-key are still recognized for exact duplicate retries.
+Webhook messages are deduplicated by Mastodon object ID: report webhooks by
+report ID, and account webhooks by account ID. The bot sends new Telegram
+messages only for new reports and confirmed accounts. Later webhooks for the
+same object edit the existing Telegram message when a mapping exists; otherwise
+they are ignored.
 
 ## Docker
 

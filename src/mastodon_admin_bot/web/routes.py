@@ -5,10 +5,12 @@ from typing import Any
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import InlineKeyboardMarkup
 from aiohttp import web
 
 from mastodon_admin_bot.config import Settings
+from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.client import MastodonClient
 from mastodon_admin_bot.mastodon.webhooks import is_pending_local_account, parse_webhook_payload
 from mastodon_admin_bot.security import verify_mastodon_signature
@@ -17,11 +19,17 @@ from mastodon_admin_bot.telegram.keyboards import account_keyboard, report_keybo
 from mastodon_admin_bot.telegram.render import (
     render_account_event,
     render_report_event,
-    render_status_event,
 )
 
+_WEBHOOK_LOCKS = KeyedAsyncLocks()
 
-def build_routes(settings: Settings, repository: Repository, bot: Bot) -> web.RouteTableDef:
+
+def build_routes(
+    settings: Settings,
+    repository: Repository,
+    bot: Bot,
+    webhook_locks: KeyedAsyncLocks = _WEBHOOK_LOCKS,
+) -> web.RouteTableDef:
     routes = web.RouteTableDef()
 
     @routes.get("/healthz")
@@ -45,41 +53,30 @@ def build_routes(settings: Settings, repository: Repository, bot: Bot) -> web.Ro
         except (json.JSONDecodeError, ValueError) as exc:
             return web.json_response({"error": str(exc)}, status=400)
 
-        stored, inserted = await repository.record_webhook_event(
-            dedupe_key=event.dedupe_key,
-            event_type=event.event,
-            object_id=event.object_id,
-            payload=payload,
-            legacy_dedupe_key=event.legacy_dedupe_key,
-        )
+        object_type = _object_type_for_event(event.event)
+        if object_type is None or event.object_id is None:
+            return web.json_response({"ok": True, "ignored": True})
 
         failed_chat_ids: list[int] = []
         if settings.telegram_home_chat_ids:
-            if inserted:
-                chat_ids = settings.telegram_home_chat_ids
-            else:
-                pending_deliveries = await repository.get_pending_deliveries(stored.id)
-                chat_ids = {delivery.chat_id for delivery in pending_deliveries}
-            for chat_id in chat_ids:
-                await repository.ensure_delivery(stored.id, chat_id)
-                try:
-                    message = await _send_event_message(
-                        bot=bot,
-                        chat_id=chat_id,
-                        event_id=stored.id,
-                        event_name=event.event,
-                        obj=event.object,
-                        mastodon_origin=settings.mastodon_origin,
-                    )
-                    await repository.mark_delivery_sent(stored.id, chat_id, message.message_id)
-                except TelegramAPIError as exc:
+            for chat_id in settings.telegram_home_chat_ids:
+                failed = await _deliver_event_to_chat(
+                    repository=repository,
+                    bot=bot,
+                    webhook_locks=webhook_locks,
+                    chat_id=chat_id,
+                    object_type=object_type,
+                    object_id=event.object_id,
+                    event_name=event.event,
+                    obj=event.object,
+                    mastodon_origin=settings.mastodon_origin,
+                )
+                if failed:
                     failed_chat_ids.append(chat_id)
-                    await repository.mark_delivery_failed(stored.id, chat_id, str(exc))
         status = 502 if failed_chat_ids else 200
         return web.json_response(
             {
                 "ok": not failed_chat_ids,
-                "duplicate": not inserted,
                 "failed_chat_ids": failed_chat_ids,
             },
             status=status,
@@ -131,36 +128,11 @@ async def _send_event_message(
     *,
     bot: Bot,
     chat_id: int,
-    event_id: int,
     event_name: str,
     obj: dict[str, Any],
     mastodon_origin: str,
 ) -> Any:
-    if event_name.startswith("account."):
-        text = render_account_event(event_name, obj)
-        account_id = str(obj.get("id"))
-        url = f"{mastodon_origin}/admin/accounts/{account_id}" if account_id else None
-        keyboard = (
-            account_keyboard(account_id, event_id, url) if is_pending_local_account(obj) else None
-        )
-    elif event_name.startswith("report."):
-        text = render_report_event(obj)
-        report_id = str(obj.get("id"))
-        target = obj.get("target_account")
-        target_id = str(target.get("id")) if isinstance(target, dict) and target.get("id") else None
-        keyboard = report_keyboard(
-            report_id,
-            target_id,
-            event_id,
-            f"{mastodon_origin}/admin/reports/{report_id}",
-        )
-    elif event_name.startswith("status."):
-        text = render_status_event(obj, event_name)
-        keyboard = None
-    else:
-        text = f"Unsupported Mastodon webhook event: {event_name}"
-        keyboard = None
-
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin)
     return await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -168,3 +140,128 @@ async def _send_event_message(
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+
+
+async def _deliver_event_to_chat(
+    *,
+    repository: Repository,
+    bot: Bot,
+    webhook_locks: KeyedAsyncLocks,
+    chat_id: int,
+    object_type: str,
+    object_id: str,
+    event_name: str,
+    obj: dict[str, Any],
+    mastodon_origin: str,
+) -> bool:
+    lock_key = _webhook_lock_key(object_type, object_id, chat_id)
+    try:
+        async with await webhook_locks.acquire(lock_key):
+            mapping = await repository.get_message_mapping(
+                object_type=object_type,
+                object_id=object_id,
+                chat_id=chat_id,
+            )
+            if mapping is None:
+                if not _should_send_new_message(event_name, obj):
+                    return False
+                message = await _send_event_message(
+                    bot=bot,
+                    chat_id=chat_id,
+                    event_name=event_name,
+                    obj=obj,
+                    mastodon_origin=mastodon_origin,
+                )
+                await repository.upsert_message_mapping(
+                    object_type=object_type,
+                    object_id=object_id,
+                    chat_id=chat_id,
+                    message_id=message.message_id,
+                )
+            else:
+                await _edit_event_message(
+                    bot=bot,
+                    chat_id=chat_id,
+                    message_id=mapping.message_id,
+                    event_name=event_name,
+                    obj=obj,
+                    mastodon_origin=mastodon_origin,
+                )
+    except TelegramAPIError as exc:
+        if _is_message_not_modified(exc):
+            return False
+        # Keep the existing mapping; a later webhook can retry the edit.
+        return True
+    return False
+
+
+async def _edit_event_message(
+    *,
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    event_name: str,
+    obj: dict[str, Any],
+    mastodon_origin: str,
+) -> Any:
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin)
+    return await bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=message_id,
+        text=text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+def _render_event_message(
+    event_name: str,
+    obj: dict[str, Any],
+    mastodon_origin: str,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    if event_name.startswith("account."):
+        text = render_account_event(event_name, obj)
+        account_id = str(obj.get("id"))
+        url = f"{mastodon_origin}/admin/accounts/{account_id}" if account_id else None
+        keyboard = account_keyboard(account_id, url) if is_pending_local_account(obj) else None
+    elif event_name.startswith("report."):
+        text = render_report_event(obj)
+        report_id = str(obj.get("id"))
+        target = obj.get("target_account")
+        target_id = str(target.get("id")) if isinstance(target, dict) and target.get("id") else None
+        url = f"{mastodon_origin}/admin/reports/{report_id}"
+        keyboard = (
+            None
+            if obj.get("action_taken") is True
+            else report_keyboard(report_id, target_id, url)
+        )
+    else:
+        text = f"Unsupported Mastodon webhook event: {event_name}"
+        keyboard = None
+
+    return text, keyboard
+
+
+def _object_type_for_event(event_name: str) -> str | None:
+    if event_name.startswith("account."):
+        return "account"
+    if event_name.startswith("report."):
+        return "report"
+    return None
+
+
+def _should_send_new_message(event_name: str, obj: dict[str, Any]) -> bool:
+    if event_name == "report.created":
+        return True
+    if event_name in {"account.created", "account.approved", "account.updated"}:
+        return obj.get("confirmed") is True
+    return False
+
+
+def _is_message_not_modified(exc: TelegramAPIError) -> bool:
+    return isinstance(exc, TelegramBadRequest) and "message is not modified" in exc.message.lower()
+
+
+def _webhook_lock_key(object_type: str, object_id: str, chat_id: int) -> str:
+    return f"webhook:{object_type}:{object_id}:{chat_id}"
