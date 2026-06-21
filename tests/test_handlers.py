@@ -13,6 +13,7 @@ from mastodon_admin_bot.telegram.handlers import (
     _handled_suffix,
     _is_private_chat,
     _mark_current_message_handled,
+    _open_markup,
     _open_url,
     _run_action,
     _run_locked_action,
@@ -53,6 +54,23 @@ def test_open_url_uses_callback_object_page() -> None:
     assert _open_url("https://mastodon.example/", report) == (
         "https://mastodon.example/admin/reports/456"
     )
+
+
+def test_account_rejection_has_no_open_button() -> None:
+    callback = AdminCallback(action=Action.REJECT_ACCOUNT, object_id="123")
+
+    assert _open_markup("https://mastodon.example", callback) is None
+
+
+def test_account_approval_keeps_open_button() -> None:
+    callback = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="123")
+
+    keyboard = _open_markup("https://mastodon.example", callback)
+
+    assert keyboard is not None
+    button = keyboard.inline_keyboard[0][0]
+    assert button.text == "Open"
+    assert button.url == "https://mastodon.example/admin/accounts/123"
 
 
 def test_action_result_text_uses_mastodon_report_result() -> None:

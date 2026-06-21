@@ -181,6 +181,29 @@ def test_report_message_omits_forwarding_for_local_target() -> None:
     assert "Previous strikes:" not in rendered
 
 
+def test_report_status_link_uses_labeled_anchor() -> None:
+    rendered = render_report_event(
+        {
+            "id": "1",
+            "action_taken": False,
+            "account": {"account": {"acct": "reporter"}},
+            "target_account": {"account": {"acct": "target"}},
+            "statuses": [
+                {
+                    "content": "<p>Reported status</p>",
+                    "url": 'https://remote.example/@target/123?q="bad"',
+                    "account": {"acct": "target"},
+                }
+            ],
+        }
+    )
+
+    assert "Reported status" in rendered
+    assert 'href="https://remote.example/@target/123?q=&quot;bad&quot;"' in rendered
+    assert ">Link↗</a>" in rendered
+    assert '123?q="bad"' not in rendered
+
+
 def test_largest_callback_payload_fits_telegram_limit() -> None:
     callback = AdminCallback(
         action=Action.SUSPEND_TARGET,

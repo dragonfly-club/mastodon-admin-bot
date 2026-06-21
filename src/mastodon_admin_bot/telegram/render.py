@@ -86,7 +86,7 @@ def render_report_event(report: dict[str, Any]) -> str:
     for status in statuses[:3]:
         if isinstance(status, dict):
             lines.append("")
-            lines.append(escape(summarize_status(status)))
+            lines.append(_render_status_summary(status))
     if len(statuses) > 3:
         lines.append(f"\n+{len(statuses) - 3} more attached statuses")
     return "\n".join(lines)
@@ -98,6 +98,14 @@ def _yes_no(value: Any) -> str:
     if value is False:
         return "no"
     return "unknown"
+
+
+def _render_status_summary(status: dict[str, Any]) -> str:
+    summary = escape(summarize_status(status, include_url=False))
+    url = status.get("url") or status.get("uri")
+    if isinstance(url, str) and _is_safe_http_url(url):
+        return f'{summary}\n<a href="{escape(url, quote=True)}">Link↗</a>'
+    return summary
 
 
 def _is_remote_account(admin_account: dict[str, Any] | None) -> bool:

@@ -47,9 +47,13 @@ uv run alembic upgrade head
 
 Webhook messages are deduplicated by Mastodon object ID: report webhooks by
 report ID, and account webhooks by account ID. The bot sends new Telegram
-messages only for new reports and new pending account registrations. Later
-webhooks for the same object edit the existing Telegram message when a mapping
-exists; otherwise they are ignored.
+messages only for `report.created` and pending local `account.created` events.
+Other webhook events, including `report.updated`, `account.updated`, and
+`account.approved`, are ignored. Moderation actions taken from Telegram update
+the clicked message; matching messages in other configured chats have their
+moderation buttons replaced with an Open button when there is still a useful
+admin page to inspect. Rejected account registrations are marked handled without
+an Open button.
 
 ## Docker
 

@@ -121,11 +121,6 @@ class MastodonClient:
             raise MastodonApiError(response.status_code, "unexpected non-object response")
         raise self._api_error(response)
 
-    def _empty_or_error(self, response: httpx.Response) -> None:
-        if response.is_success:
-            return
-        raise self._api_error(response)
-
     def _api_error(self, response: httpx.Response) -> MastodonApiError:
         message = response.text
         try:

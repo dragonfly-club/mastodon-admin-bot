@@ -65,7 +65,7 @@ def html_to_text(value: str | None) -> str:
     return " ".join(text.split())
 
 
-def summarize_status(status: dict[str, Any], limit: int = 280) -> str:
+def summarize_status(status: dict[str, Any], limit: int = 280, include_url: bool = True) -> str:
     status_account = status.get("account")
     author = account_acct(status_account if isinstance(status_account, dict) else None)
     content = html_to_text(str(status.get("content") or ""))
@@ -73,7 +73,7 @@ def summarize_status(status: dict[str, Any], limit: int = 280) -> str:
     summary = f"@{author}: {content}" if content else f"@{author}: <empty status>"
     if len(summary) > limit:
         summary = f"{summary[: limit - 1]}…"
-    if url:
+    if include_url and url:
         summary = f"{summary}\n{url}"
     return summary
 

@@ -298,7 +298,12 @@ def _account_result_event(action: Action) -> str:
             raise ValueError(f"unsupported account action: {action}")
 
 
-def _open_markup(mastodon_origin: str, callback_data: AdminCallback) -> InlineKeyboardMarkup:
+def _open_markup(
+    mastodon_origin: str,
+    callback_data: AdminCallback,
+) -> InlineKeyboardMarkup | None:
+    if callback_data.action == Action.REJECT_ACCOUNT:
+        return None
     return open_keyboard(_open_url(mastodon_origin, callback_data))
 
 
