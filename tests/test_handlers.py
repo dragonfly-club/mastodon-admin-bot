@@ -9,9 +9,11 @@ from aiogram.methods import EditMessageText
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.telegram.handlers import (
     _action_lock_key,
+    _action_result_text,
     _handled_suffix,
     _is_private_chat,
     _mark_current_message_handled,
+    _open_url,
     _run_action,
     _run_locked_action,
 )
@@ -39,6 +41,67 @@ def test_handled_suffix_escapes_mastodon_username() -> None:
     suffix = _handled_suffix('admin"><b>bad</b>', Action.RESOLVE_REPORT)
 
     assert suffix == "\n\nHandled by admin&quot;&gt;&lt;b&gt;bad&lt;/b&gt;: Resolved report"
+
+
+def test_open_url_uses_callback_object_page() -> None:
+    account = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="123")
+    report = AdminCallback(action=Action.SUSPEND_TARGET, object_id="456", target_id="789")
+
+    assert _open_url("https://mastodon.example/", account) == (
+        "https://mastodon.example/admin/accounts/123"
+    )
+    assert _open_url("https://mastodon.example/", report) == (
+        "https://mastodon.example/admin/reports/456"
+    )
+
+
+def test_action_result_text_uses_mastodon_report_result() -> None:
+    text = _action_result_text(
+        current_text="old report text",
+        callback_data=AdminCallback(action=Action.RESOLVE_REPORT, object_id="456"),
+        api_result={
+            "id": "456",
+            "action_taken": True,
+            "account": {"account": {"acct": "reporter"}},
+            "target_account": {"account": {"acct": "target"}},
+        },
+        mastodon_username="mod",
+    )
+
+    assert "State: resolved" in text
+    assert "old report text" not in text
+    assert "Handled by mod: Resolved report" in text
+
+
+def test_action_result_text_falls_back_for_empty_mastodon_result() -> None:
+    text = _action_result_text(
+        current_text="old report text",
+        callback_data=AdminCallback(action=Action.SUSPEND_TARGET, object_id="456", target_id="789"),
+        api_result={},
+        mastodon_username="mod",
+    )
+
+    assert text == "old report text\n\nHandled by mod: Suspended target account"
+
+
+def test_action_result_text_shows_returned_account_approval() -> None:
+    text = _action_result_text(
+        current_text="old account text",
+        callback_data=AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="123"),
+        api_result={
+            "id": "123",
+            "approved": True,
+            "email": "alice@example.test",
+            "ip": "192.0.2.1",
+            "locale": "en",
+            "account": {"acct": "alice"},
+        },
+        mastodon_username="mod",
+    )
+
+    assert "Approved: yes" in text
+    assert "old account text" not in text
+    assert "Handled by mod: Approved account" in text
 
 
 async def test_action_http_failure_returns_retry_message() -> None:

@@ -17,7 +17,11 @@ from mastodon_admin_bot.mastodon.webhooks import (
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.repository import Repository, create_engine
 from mastodon_admin_bot.telegram.keyboards import Action, AdminCallback
-from mastodon_admin_bot.telegram.render import admin_account_link
+from mastodon_admin_bot.telegram.render import (
+    admin_account_link,
+    render_account_event,
+    render_report_event,
+)
 from mastodon_admin_bot.web.routes import (
     _deliver_event_to_chat,
     _object_type_for_event,
@@ -97,9 +101,6 @@ def test_new_message_policy_sends_pending_account_created() -> None:
     assert _should_send_new_message("account.created", {"id": "1", "approved": False})
     assert _should_send_new_message("account.created", {"id": "1", "approved": None})
     assert not _should_send_new_message("account.created", {"id": "1", "approved": True})
-    assert not _should_send_new_message("account.updated", {"id": "1", "approved": False})
-    assert not _should_send_new_message("account.approved", {"id": "1", "approved": True})
-    assert not _should_send_new_message("report.updated", {"id": "1"})
 
 
 def test_is_pending_local_account() -> None:
@@ -127,6 +128,59 @@ def test_admin_account_link_rejects_non_http_urls() -> None:
     )
 
 
+def test_pending_account_message_omits_admin_noise_fields() -> None:
+    rendered = render_account_event(
+        "account.created",
+        {
+            "id": "123",
+            "approved": False,
+            "created_at": "2024-01-01T00:00:00Z",
+            "email": "alice@example.test",
+            "ip": "192.0.2.1",
+            "locale": "en",
+            "account": {"acct": "alice"},
+        },
+    )
+
+    assert "ID:" not in rendered
+    assert "Approved:" not in rendered
+    assert "Created:" not in rendered
+    assert "Email: alice@example.test" in rendered
+
+
+def test_report_message_shows_remote_forwarding() -> None:
+    rendered = render_report_event(
+        {
+            "id": "1",
+            "action_taken": False,
+            "forwarded": True,
+            "account": {"account": {"acct": "reporter"}},
+            "target_account": {
+                "domain": "remote.example",
+                "account": {"acct": "target@remote.example"},
+            },
+        }
+    )
+
+    assert "Forwarded to remote: yes" in rendered
+    assert "Previous strikes:" not in rendered
+
+
+def test_report_message_omits_forwarding_for_local_target() -> None:
+    rendered = render_report_event(
+        {
+            "id": "1",
+            "action_taken": False,
+            "forwarded": True,
+            "account": {"account": {"acct": "reporter"}},
+            "target_account": {"domain": None, "account": {"acct": "target"}},
+        }
+    )
+
+    assert "Forwarded to remote:" not in rendered
+    assert "Previous strikes:" not in rendered
+
+
 def test_largest_callback_payload_fits_telegram_limit() -> None:
     callback = AdminCallback(
         action=Action.SUSPEND_TARGET,
@@ -137,14 +191,19 @@ def test_largest_callback_payload_fits_telegram_limit() -> None:
     assert len(callback.encode()) <= 64
 
 
-def test_resolved_report_does_not_restore_moderation_keyboard() -> None:
+def test_resolved_created_report_keeps_open_button_only() -> None:
     _text, keyboard = _render_event_message(
-        "report.updated",
+        "report.created",
         {"id": "1", "action_taken": True},
         "https://mastodon.example",
     )
 
-    assert keyboard is None
+    assert keyboard is not None
+    assert len(keyboard.inline_keyboard) == 1
+    assert len(keyboard.inline_keyboard[0]) == 1
+    button = keyboard.inline_keyboard[0][0]
+    assert button.text == "Open"
+    assert button.url == "https://mastodon.example/admin/reports/1"
 
 
 async def test_concurrent_duplicate_webhook_delivery_sends_once() -> None:

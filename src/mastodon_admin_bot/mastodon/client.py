@@ -97,7 +97,7 @@ class MastodonClient:
         report_id: str | None = None,
         text: str | None = None,
         send_email_notification: bool = True,
-    ) -> None:
+    ) -> dict[str, Any]:
         data: dict[str, str | bool] = {
             "type": action_type,
             "send_email_notification": send_email_notification,
@@ -111,7 +111,7 @@ class MastodonClient:
             headers=self._headers(),
             data=data,
         )
-        self._empty_or_error(response)
+        return self._json_or_error(response)
 
     def _json_or_error(self, response: httpx.Response) -> dict[str, Any]:
         if response.is_success:

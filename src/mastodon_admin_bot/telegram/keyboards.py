@@ -44,6 +44,12 @@ def account_keyboard(
     return builder.as_markup()
 
 
+def open_keyboard(url: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Open", url=url)
+    return builder.as_markup()
+
+
 def report_keyboard(
     report_id: str,
     target_account_id: str | None,

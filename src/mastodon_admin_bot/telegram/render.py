@@ -32,17 +32,19 @@ def render_account_event(event: str, account: dict[str, Any]) -> str:
     email = account.get("email") or "unknown"
     ip = account.get("ip") or "unknown"
     locale = account.get("locale") or "unknown"
-    created_at = account.get("created_at") or "unknown"
     lines = [
         hbold(title),
         f"Account: {admin_account_link(account)}",
-        f"ID: {hcode(str(account.get('id', 'unknown')))}",
         f"Email: {escape(str(email))}",
-        f"Approved: {_yes_no(account.get('approved'))}",
-        f"IP: {escape(str(ip))}",
-        f"Locale: {escape(str(locale))}",
-        f"Created: {escape(str(created_at))}",
     ]
+    if event != "account.created":
+        lines.append(f"Approved: {_yes_no(account.get('approved'))}")
+    lines.extend(
+        [
+            f"IP: {escape(str(ip))}",
+            f"Locale: {escape(str(locale))}",
+        ]
+    )
     if invite_request:
         lines.append(f"Reason: {escape(str(invite_request))}")
     return "\n".join(lines)
@@ -71,6 +73,8 @@ def render_report_event(report: dict[str, Any]) -> str:
         f"Category: {escape(category)}",
         f"State: {escape(state)}",
     ]
+    if _is_remote_account(target_account if isinstance(target_account, dict) else None):
+        lines.append(f"Forwarded to remote: {_yes_no(report.get('forwarded'))}")
     if comment:
         lines.append(f"Comment: {escape(comment)}")
     if rules:
@@ -94,3 +98,13 @@ def _yes_no(value: Any) -> str:
     if value is False:
         return "no"
     return "unknown"
+
+
+def _is_remote_account(admin_account: dict[str, Any] | None) -> bool:
+    if not admin_account:
+        return False
+    domain = admin_account.get("domain")
+    if domain:
+        return True
+    account = admin_account.get("account")
+    return isinstance(account, dict) and "@" in str(account.get("acct") or "")

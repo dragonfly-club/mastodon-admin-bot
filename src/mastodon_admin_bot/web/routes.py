@@ -15,7 +15,7 @@ from mastodon_admin_bot.mastodon.client import MastodonClient
 from mastodon_admin_bot.mastodon.webhooks import is_pending_local_account, parse_webhook_payload
 from mastodon_admin_bot.security import verify_mastodon_signature
 from mastodon_admin_bot.storage.repository import Repository
-from mastodon_admin_bot.telegram.keyboards import account_keyboard, report_keyboard
+from mastodon_admin_bot.telegram.keyboards import account_keyboard, open_keyboard, report_keyboard
 from mastodon_admin_bot.telegram.render import (
     render_account_event,
     render_report_event,
@@ -220,19 +220,19 @@ def _render_event_message(
     obj: dict[str, Any],
     mastodon_origin: str,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    if event_name.startswith("account."):
+    if event_name == "account.created":
         text = render_account_event(event_name, obj)
         account_id = str(obj.get("id"))
         url = f"{mastodon_origin}/admin/accounts/{account_id}" if account_id else None
         keyboard = account_keyboard(account_id, url) if is_pending_local_account(obj) else None
-    elif event_name.startswith("report."):
+    elif event_name == "report.created":
         text = render_report_event(obj)
         report_id = str(obj.get("id"))
         target = obj.get("target_account")
         target_id = str(target.get("id")) if isinstance(target, dict) and target.get("id") else None
         url = f"{mastodon_origin}/admin/reports/{report_id}"
         keyboard = (
-            None
+            open_keyboard(url)
             if obj.get("action_taken") is True
             else report_keyboard(report_id, target_id, url)
         )
@@ -244,9 +244,9 @@ def _render_event_message(
 
 
 def _object_type_for_event(event_name: str) -> str | None:
-    if event_name.startswith("account."):
+    if event_name == "account.created":
         return "account"
-    if event_name.startswith("report."):
+    if event_name == "report.created":
         return "report"
     return None
 

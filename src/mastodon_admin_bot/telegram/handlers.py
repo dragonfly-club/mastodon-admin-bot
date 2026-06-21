@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from html import escape
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
@@ -10,7 +11,7 @@ from aiogram import Bot, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InaccessibleMessage, Message
+from aiogram.types import CallbackQuery, InaccessibleMessage, InlineKeyboardMarkup, Message
 
 from mastodon_admin_bot.config import Settings
 from mastodon_admin_bot.locks import KeyedAsyncLocks
@@ -18,7 +19,8 @@ from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.security import make_state
 from mastodon_admin_bot.storage.repository import Repository
 
-from .keyboards import Action, AdminCallback
+from .keyboards import Action, AdminCallback, open_keyboard
+from .render import render_account_event, render_report_event
 
 logger = logging.getLogger(__name__)
 _ACTION_LOCKS = KeyedAsyncLocks()
@@ -100,11 +102,11 @@ def build_router(
             return
         token, mastodon_username = token_data
 
-        async def execute_action() -> None:
+        async def execute_action() -> dict[str, Any]:
             async with MastodonClient(settings.mastodon_origin, token=token) as client:
-                await _execute_action(client, callback_data)
+                return await _execute_action(client, callback_data)
 
-        error_message = await _run_locked_action(
+        error_message, api_result = await _run_locked_action_result(
             action_locks,
             handled_action_keys,
             _action_lock_key(callback_data),
@@ -116,13 +118,19 @@ def build_router(
 
         await query.answer("Done.")
         if query.message and not isinstance(query.message, InaccessibleMessage):
-            suffix = _handled_suffix(mastodon_username, callback_data.action)
             current_text = query.message.html_text or query.message.text or ""
+            open_markup = _open_markup(settings.mastodon_origin, callback_data)
             await _mark_current_message_handled(
                 bot=bot,
                 chat_id=query.message.chat.id,
                 message_id=query.message.message_id,
-                text=f"{current_text}{suffix}",
+                text=_action_result_text(
+                    current_text=current_text,
+                    callback_data=callback_data,
+                    api_result=api_result,
+                    mastodon_username=mastodon_username,
+                ),
+                reply_markup=open_markup,
             )
             for mapping in await repository.get_message_mappings(
                 object_type=_callback_mapping_object_type(callback_data),
@@ -137,7 +145,7 @@ def build_router(
                     await bot.edit_message_reply_markup(
                         chat_id=mapping.chat_id,
                         message_id=mapping.message_id,
-                        reply_markup=None,
+                        reply_markup=open_markup,
                     )
                 except TelegramAPIError:
                     logger.warning(
@@ -145,18 +153,21 @@ def build_router(
                         extra={"chat_id": mapping.chat_id, "message_id": mapping.message_id},
                     )
 
-    async def _execute_action(client: MastodonClient, callback_data: AdminCallback) -> None:
+    async def _execute_action(
+        client: MastodonClient,
+        callback_data: AdminCallback,
+    ) -> dict[str, Any]:
         match callback_data.action:
             case Action.APPROVE_ACCOUNT:
-                await client.approve_account(callback_data.object_id)
+                return await client.approve_account(callback_data.object_id)
             case Action.REJECT_ACCOUNT:
-                await client.reject_account(callback_data.object_id)
+                return await client.reject_account(callback_data.object_id)
             case Action.RESOLVE_REPORT:
-                await client.resolve_report(callback_data.object_id)
+                return await client.resolve_report(callback_data.object_id)
             case Action.LIMIT_TARGET:
                 if callback_data.target_id is None:
                     raise MastodonApiError(400, "missing target account id")
-                await client.account_action(
+                return await client.account_action(
                     account_id=callback_data.target_id,
                     action_type="silence",
                     report_id=callback_data.object_id,
@@ -165,7 +176,7 @@ def build_router(
             case Action.SUSPEND_TARGET:
                 if callback_data.target_id is None:
                     raise MastodonApiError(400, "missing target account id")
-                await client.account_action(
+                return await client.account_action(
                     account_id=callback_data.target_id,
                     action_type="suspend",
                     report_id=callback_data.object_id,
@@ -185,6 +196,7 @@ async def _mark_current_message_handled(
     chat_id: int,
     message_id: int,
     text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> None:
     try:
         await bot.edit_message_text(
@@ -192,7 +204,7 @@ async def _mark_current_message_handled(
             message_id=message_id,
             text=text,
             parse_mode=ParseMode.HTML,
-            reply_markup=None,
+            reply_markup=reply_markup,
             disable_web_page_preview=True,
         )
     except TelegramAPIError as exc:
@@ -209,36 +221,95 @@ def _is_message_not_modified(exc: TelegramAPIError) -> bool:
 
 
 async def _run_action(
-    execute: Callable[[], Awaitable[None]],
+    execute: Callable[[], Awaitable[Any]],
 ) -> str | None:
+    error_message, _result = await _run_action_result(execute)
+    return error_message
+
+
+async def _run_action_result(
+    execute: Callable[[], Awaitable[Any]],
+) -> tuple[str | None, Any | None]:
     try:
-        await execute()
+        result = await execute()
     except MastodonApiError as exc:
-        return f"Mastodon rejected action: {exc.message}"
+        return f"Mastodon rejected action: {exc.message}", None
     except (httpx.HTTPError, ValueError, KeyError):
-        return "Mastodon action failed. Please retry."
+        return "Mastodon action failed. Please retry.", None
     except Exception:
         logger.exception("Unexpected moderation action failure")
-        return "Unexpected moderation action failure. Please retry."
-    return None
+        return "Unexpected moderation action failure. Please retry.", None
+    return None, result
 
 
 async def _run_locked_action(
     locks: KeyedAsyncLocks,
     handled_keys: set[str],
     lock_key: str,
-    execute: Callable[[], Awaitable[None]],
+    execute: Callable[[], Awaitable[Any]],
 ) -> str | None:
+    error_message, _result = await _run_locked_action_result(locks, handled_keys, lock_key, execute)
+    return error_message
+
+
+async def _run_locked_action_result(
+    locks: KeyedAsyncLocks,
+    handled_keys: set[str],
+    lock_key: str,
+    execute: Callable[[], Awaitable[Any]],
+) -> tuple[str | None, Any | None]:
     lock = await locks.try_acquire(lock_key)
     if lock is None:
-        return "That moderation decision is already being handled."
+        return "That moderation decision is already being handled.", None
     async with lock:
         if lock_key in handled_keys:
-            return "That moderation decision was already handled."
-        error_message = await _run_action(execute)
+            return "That moderation decision was already handled.", None
+        error_message, result = await _run_action_result(execute)
         if error_message is None:
             handled_keys.add(lock_key)
-        return error_message
+        return error_message, result
+
+
+def _action_result_text(
+    *,
+    current_text: str,
+    callback_data: AdminCallback,
+    api_result: Any,
+    mastodon_username: str,
+) -> str:
+    if isinstance(api_result, dict) and api_result:
+        match _callback_mapping_object_type(callback_data):
+            case "account":
+                text = render_account_event(_account_result_event(callback_data.action), api_result)
+            case "report":
+                text = render_report_event(api_result)
+    else:
+        text = current_text
+    return f"{text}{_handled_suffix(mastodon_username, callback_data.action)}"
+
+
+def _account_result_event(action: Action) -> str:
+    match action:
+        case Action.APPROVE_ACCOUNT:
+            return "account.approved"
+        case Action.REJECT_ACCOUNT:
+            return "account.rejected"
+        case _:
+            raise ValueError(f"unsupported account action: {action}")
+
+
+def _open_markup(mastodon_origin: str, callback_data: AdminCallback) -> InlineKeyboardMarkup:
+    return open_keyboard(_open_url(mastodon_origin, callback_data))
+
+
+def _open_url(mastodon_origin: str, callback_data: AdminCallback) -> str:
+    origin = mastodon_origin.rstrip("/")
+    match _callback_mapping_object_type(callback_data):
+        case "account":
+            return f"{origin}/admin/accounts/{callback_data.object_id}"
+        case "report":
+            return f"{origin}/admin/reports/{callback_data.object_id}"
+    raise ValueError(f"unsupported callback action: {callback_data.action}")
 
 
 def _handled_suffix(mastodon_username: str, action: Action) -> str:
