@@ -11,6 +11,11 @@ class Action(StrEnum):
     RESOLVE_REPORT = "rr"
     LIMIT_TARGET = "al"
     SUSPEND_TARGET = "au"
+    FORCE_APPROVE_ACCOUNT = "af"
+    REJECT_NOW_ACCOUNT = "rn"
+    BLOCK_EMAIL = "be"
+    BLOCK_EMAIL_DOMAIN = "bd"
+    BLOCK_REASON = "br"
 
 
 class AdminCallback(CallbackData, prefix="a"):
@@ -40,6 +45,61 @@ def account_keyboard(
     )
     if url:
         builder.button(text="Open", url=url)
+    builder.adjust(2, 1)
+    return builder.as_markup()
+
+
+def autoban_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="Force Approve",
+        callback_data=AdminCallback(
+            action=Action.FORCE_APPROVE_ACCOUNT,
+            object_id=account_id,
+        ),
+    )
+    builder.button(
+        text="Reject Now",
+        callback_data=AdminCallback(
+            action=Action.REJECT_NOW_ACCOUNT,
+            object_id=account_id,
+        ),
+    )
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def post_rejection_keyboard(
+    account_id: str,
+    *,
+    include_reason: bool = False,
+    exclude: Action | None = None,
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if exclude != Action.BLOCK_EMAIL:
+        builder.button(
+            text="Block Email",
+            callback_data=AdminCallback(
+                action=Action.BLOCK_EMAIL,
+                object_id=account_id,
+            ),
+        )
+    if exclude != Action.BLOCK_EMAIL_DOMAIN:
+        builder.button(
+            text="Block Domain",
+            callback_data=AdminCallback(
+                action=Action.BLOCK_EMAIL_DOMAIN,
+                object_id=account_id,
+            ),
+        )
+    if include_reason and exclude != Action.BLOCK_REASON:
+        builder.button(
+            text="Block Reason",
+            callback_data=AdminCallback(
+                action=Action.BLOCK_REASON,
+                object_id=account_id,
+            ),
+        )
     builder.adjust(2, 1)
     return builder.as_markup()
 

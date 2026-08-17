@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import event, or_, select
+from sqlalchemy import CursorResult, delete, event, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -15,9 +15,12 @@ from sqlalchemy.ext.asyncio import (
 from mastodon_admin_bot.security import TokenCipher
 
 from .models import (
+    AppSetting,
     Base,
+    BlocklistRule,
     ModeratorLink,
     OAuthState,
+    PendingAccount,
     TelegramMessageMapping,
 )
 
@@ -198,3 +201,190 @@ class Repository:
                 existing.message_id = message_id
                 await session.commit()
                 return existing
+
+    async def add_blocklist_rule(
+        self,
+        *,
+        rule_type: str,
+        pattern: str,
+        created_by: int | None = None,
+    ) -> tuple[BlocklistRule, bool]:
+        async with self.sessionmaker() as session:
+            existing = await session.scalar(
+                select(BlocklistRule).where(
+                    BlocklistRule.rule_type == rule_type,
+                    BlocklistRule.pattern == pattern,
+                )
+            )
+            if existing is not None:
+                await session.commit()
+                return existing, False
+            rule = BlocklistRule(
+                rule_type=rule_type,
+                pattern=pattern,
+                created_by=created_by,
+            )
+            session.add(rule)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = await session.scalar(
+                    select(BlocklistRule).where(
+                        BlocklistRule.rule_type == rule_type,
+                        BlocklistRule.pattern == pattern,
+                    )
+                )
+                if existing is None:
+                    raise
+                return cast(BlocklistRule, existing), False
+            await session.refresh(rule)
+            return rule, True
+
+    async def remove_blocklist_rule(self, *, rule_type: str, pattern: str) -> int:
+        async with self.sessionmaker() as session:
+            result = await session.execute(
+                delete(BlocklistRule).where(
+                    BlocklistRule.rule_type == rule_type,
+                    BlocklistRule.pattern == pattern,
+                )
+            )
+            await session.commit()
+            return cast(CursorResult[Any], result).rowcount
+
+    async def list_blocklist_rules(self, rule_type: str | None = None) -> list[BlocklistRule]:
+        async with self.sessionmaker() as session:
+            stmt = select(BlocklistRule).order_by(
+                BlocklistRule.rule_type, BlocklistRule.created_at
+            )
+            if rule_type is not None:
+                stmt = stmt.where(BlocklistRule.rule_type == rule_type)
+            return list(await session.scalars(stmt))
+
+    async def upsert_pending_account(
+        self,
+        *,
+        account_id: str,
+        account_snapshot: str,
+        matched_rule_type: str | None = None,
+        matched_pattern: str | None = None,
+        matched_rule_created_by: int | None = None,
+        auto_reject_at: datetime | None = None,
+    ) -> PendingAccount:
+        async with self.sessionmaker() as session:
+            existing = await session.scalar(
+                select(PendingAccount).where(PendingAccount.account_id == account_id)
+            )
+            if existing is not None:
+                await session.commit()
+                return existing
+            pending = PendingAccount(
+                account_id=account_id,
+                account_snapshot=account_snapshot,
+                matched_rule_type=matched_rule_type,
+                matched_pattern=matched_pattern,
+                matched_rule_created_by=matched_rule_created_by,
+                auto_reject_at=auto_reject_at,
+                state="pending",
+            )
+            session.add(pending)
+            try:
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = await session.scalar(
+                    select(PendingAccount).where(
+                        PendingAccount.account_id == account_id
+                    )
+                )
+                if existing is None:
+                    raise
+                return cast(PendingAccount, existing)
+            await session.refresh(pending)
+            return pending
+
+    async def get_pending_account(self, account_id: str) -> PendingAccount | None:
+        async with self.sessionmaker() as session:
+            return cast(
+                PendingAccount | None,
+                await session.scalar(
+                    select(PendingAccount).where(
+                        PendingAccount.account_id == account_id
+                    )
+                ),
+            )
+
+    async def list_due_pending_auto_bans(self, now: datetime) -> list[PendingAccount]:
+        async with self.sessionmaker() as session:
+            return list(
+                await session.scalars(
+                    select(PendingAccount).where(
+                        PendingAccount.state == "pending",
+                        PendingAccount.auto_reject_at.is_not(None),
+                        PendingAccount.auto_reject_at <= now,
+                    ).order_by(PendingAccount.auto_reject_at)
+                )
+            )
+
+    async def mark_pending_account_handled(
+        self,
+        *,
+        account_id: str,
+        state: str,
+        handled_by: str | None = None,
+    ) -> None:
+        async with self.sessionmaker() as session:
+            pending = await session.scalar(
+                select(PendingAccount).where(PendingAccount.account_id == account_id)
+            )
+            if pending is None:
+                await session.commit()
+                return
+            pending.state = state
+            pending.handled_at = datetime.now(UTC)
+            pending.handled_by = handled_by
+            await session.commit()
+
+    async def get_setting(self, key: str, default: str | None = None) -> str | None:
+        async with self.sessionmaker() as session:
+            setting = await session.get(AppSetting, key)
+            return setting.value if setting is not None else default
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with self.sessionmaker() as session:
+            existing = await session.get(AppSetting, key)
+            if existing is None:
+                session.add(AppSetting(key=key, value=value))
+            else:
+                existing.value = value
+            await session.commit()
+
+    async def get_autoban_timeout_seconds(self, default: int) -> int:
+        raw = await self.get_setting("autoban_reject_after_seconds")
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            return default
+        return value
+
+    async def set_autoban_timeout_seconds(self, seconds: int) -> None:
+        await self.set_setting("autoban_reject_after_seconds", str(seconds))
+
+    async def get_linked_moderator_token(
+        self,
+        preferred_telegram_user_id: int | None = None,
+    ) -> tuple[str, str] | None:
+        async with self.sessionmaker() as session:
+            if preferred_telegram_user_id is not None:
+                link = await session.get(ModeratorLink, preferred_telegram_user_id)
+                if link is not None:
+                    return self.cipher.decrypt(link.encrypted_access_token), link.mastodon_username
+            link = cast(
+                ModeratorLink | None,
+                await session.scalar(select(ModeratorLink).order_by(ModeratorLink.created_at)),
+            )
+            if link is None:
+                return None
+            return self.cipher.decrypt(link.encrypted_access_token), link.mastodon_username

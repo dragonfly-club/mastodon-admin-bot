@@ -8,6 +8,7 @@ from aiogram.methods import EditMessageText
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from mastodon_admin_bot.autoban import AutobanInfo
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.webhooks import (
     html_to_text,
@@ -227,6 +228,54 @@ def test_resolved_created_report_keeps_open_button_only() -> None:
     button = keyboard.inline_keyboard[0][0]
     assert button.text == "Open"
     assert button.url == "https://mastodon.example/admin/reports/1"
+
+
+def test_pending_account_without_match_keeps_approve_reject_open() -> None:
+    _text, keyboard = _render_event_message(
+        "account.created",
+        {"id": "123", "approved": False, "email": "alice@example.test"},
+        "https://mastodon.example",
+    )
+
+    assert keyboard is not None
+    texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert texts == ["Approve", "Reject", "Open"]
+
+
+def test_pending_account_with_match_shows_force_approve_reject_now() -> None:
+    from datetime import UTC, datetime
+
+    autoban = AutobanInfo(
+        matched_rule_type="email",
+        matched_pattern=r"^spam@.*$",
+        auto_reject_at=datetime(2026, 6, 24, 13, 30, 0, tzinfo=UTC),
+    )
+    text, keyboard = _render_event_message(
+        "account.created",
+        {"id": "123", "approved": False, "email": "spam@evil.example"},
+        "https://mastodon.example",
+        autoban=autoban,
+    )
+
+    assert keyboard is not None
+    texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert texts == ["Force Approve", "Reject Now"]
+    assert "Autoban: email pattern" in text
+    assert "Auto-reject at: 2026-06-24 13:30:00 UTC" in text
+
+
+def test_pending_account_with_unmatched_autoban_info_keeps_default_keyboard() -> None:
+    autoban = AutobanInfo()
+    _text, keyboard = _render_event_message(
+        "account.created",
+        {"id": "123", "approved": False, "email": "alice@example.test"},
+        "https://mastodon.example",
+        autoban=autoban,
+    )
+
+    assert keyboard is not None
+    texts = [b.text for row in keyboard.inline_keyboard for b in row]
+    assert texts == ["Approve", "Reject", "Open"]
 
 
 async def test_concurrent_duplicate_webhook_delivery_sends_once() -> None:

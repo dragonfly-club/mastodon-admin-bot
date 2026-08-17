@@ -7,16 +7,24 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
 
 from mastodon_admin_bot.locks import KeyedAsyncLocks
+from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
 from mastodon_admin_bot.telegram.handlers import (
+    _account_result_event,
+    _action_label,
     _action_lock_key,
     _action_result_text,
+    _format_seconds,
     _handled_suffix,
     _is_private_chat,
     _mark_current_message_handled,
     _open_markup,
     _open_url,
+    _pending_state_for_action,
+    _post_action_markup,
+    _render_blocklist,
     _run_action,
     _run_locked_action,
+    _snapshot_has_reason,
 )
 from mastodon_admin_bot.telegram.keyboards import Action, AdminCallback
 
@@ -237,3 +245,153 @@ def test_action_lock_key_groups_conflicting_decisions() -> None:
 
     assert _action_lock_key(approve) == _action_lock_key(reject)
     assert _action_lock_key(approve) != _action_lock_key(other)
+
+
+def test_action_lock_key_groups_force_approve_and_reject_now_with_decisions() -> None:
+    approve = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="1")
+    force = AdminCallback(action=Action.FORCE_APPROVE_ACCOUNT, object_id="1")
+    reject_now = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="1")
+
+    assert _action_lock_key(approve) == _action_lock_key(force)
+    assert _action_lock_key(approve) == _action_lock_key(reject_now)
+
+
+def test_action_lock_key_uses_separate_keys_per_block_button() -> None:
+    block_email = AdminCallback(action=Action.BLOCK_EMAIL, object_id="1")
+    block_domain = AdminCallback(action=Action.BLOCK_EMAIL_DOMAIN, object_id="1")
+    decision = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="1")
+
+    assert _action_lock_key(block_email) != _action_lock_key(block_domain)
+    assert _action_lock_key(block_email) != _action_lock_key(decision)
+    assert _action_lock_key(block_email) == "block_add:1:be"
+
+
+def test_pending_state_for_action() -> None:
+    assert _pending_state_for_action(Action.APPROVE_ACCOUNT) == "approved"
+    assert _pending_state_for_action(Action.FORCE_APPROVE_ACCOUNT) == "force_approved"
+    assert _pending_state_for_action(Action.REJECT_ACCOUNT) == "rejected"
+    assert _pending_state_for_action(Action.REJECT_NOW_ACCOUNT) == "rejected"
+
+
+def test_account_result_event_handles_force_and_reject_now() -> None:
+    assert _account_result_event(Action.FORCE_APPROVE_ACCOUNT) == "account.approved"
+    assert _account_result_event(Action.REJECT_NOW_ACCOUNT) == "account.rejected"
+
+
+def test_action_label_covers_new_actions() -> None:
+    assert _action_label(Action.FORCE_APPROVE_ACCOUNT) == "Force approved account"
+    assert _action_label(Action.REJECT_NOW_ACCOUNT) == "Rejected account"
+    assert _action_label(Action.BLOCK_EMAIL) == "Added blocklist rule"
+
+
+def test_open_markup_reject_now_has_no_open_button() -> None:
+    callback = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="123")
+    assert _open_markup("https://mastodon.example", callback) is None
+
+
+def test_post_action_markup_reject_shows_block_buttons() -> None:
+    callback = AdminCallback(action=Action.REJECT_ACCOUNT, object_id="123")
+    markup = _post_action_markup("https://mastodon.example", callback, include_reason=True)
+    assert markup is not None
+    texts = [b.text for row in markup.inline_keyboard for b in row]
+    assert texts == ["Block Email", "Block Domain", "Block Reason"]
+
+
+def test_post_action_markup_reject_without_reason_omits_reason_button() -> None:
+    callback = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="123")
+    markup = _post_action_markup(
+        "https://mastodon.example", callback, include_reason=False
+    )
+    assert markup is not None
+    texts = [b.text for row in markup.inline_keyboard for b in row]
+    assert texts == ["Block Email", "Block Domain"]
+
+
+def test_post_action_markup_approve_keeps_open_button() -> None:
+    callback = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="123")
+    markup = _post_action_markup("https://mastodon.example", callback, include_reason=False)
+    assert markup is not None
+    button = markup.inline_keyboard[0][0]
+    assert button.text == "Open"
+    assert button.url == "https://mastodon.example/admin/accounts/123"
+
+
+def test_post_action_markup_force_approve_keeps_open_button() -> None:
+    callback = AdminCallback(action=Action.FORCE_APPROVE_ACCOUNT, object_id="123")
+    markup = _post_action_markup("https://mastodon.example", callback, include_reason=False)
+    assert markup is not None
+    assert markup.inline_keyboard[0][0].text == "Open"
+
+
+def test_snapshot_has_reason_reads_pending_account_snapshot() -> None:
+    with_reason = PendingAccount(account_id="1", account_snapshot='{"reason":"hi"}')
+    without_reason = PendingAccount(account_id="2", account_snapshot='{"reason":""}')
+    missing = PendingAccount(account_id="3", account_snapshot="{}")
+
+    assert _snapshot_has_reason(with_reason) is True
+    assert _snapshot_has_reason(without_reason) is False
+    assert _snapshot_has_reason(missing) is False
+    assert _snapshot_has_reason(None) is False
+
+
+def test_render_blocklist_groups_by_type() -> None:
+    rules = [
+        BlocklistRule(rule_type="email", pattern=r"^a@$"),
+        BlocklistRule(rule_type="email", pattern=r"^b@$"),
+        BlocklistRule(rule_type="reason", pattern="spam"),
+    ]
+    rendered = _render_blocklist(rules)
+    assert "<b>email</b> (2):" in rendered
+    assert "<b>reason</b> (1):" in rendered
+    assert "email_domain" not in rendered
+    assert r"^a@$" in rendered
+    assert "spam" in rendered
+
+
+def test_render_blocklist_uses_code_for_patterns() -> None:
+    rendered = _render_blocklist(
+        [BlocklistRule(rule_type="email", pattern=r"<script>")]
+    )
+    assert "<code>&lt;script&gt;</code>" in rendered
+    assert "<script>" not in rendered
+
+
+def test_format_seconds_humanizes() -> None:
+    assert _format_seconds(30) == "30s"
+    assert _format_seconds(120) == "2m"
+    assert _format_seconds(3600) == "1h"
+    assert _format_seconds(43200) == "12h"
+    assert _format_seconds(5400) == "1h 30m"
+
+
+def test_handled_suffix_for_force_approve() -> None:
+    suffix = _handled_suffix("mod", Action.FORCE_APPROVE_ACCOUNT)
+    assert "Force approved account" in suffix
+
+
+def test_action_result_text_force_approve_renders_approved_account() -> None:
+    text = _action_result_text(
+        current_text="old account text",
+        callback_data=AdminCallback(action=Action.FORCE_APPROVE_ACCOUNT, object_id="123"),
+        api_result={
+            "id": "123",
+            "approved": True,
+            "email": "spam@evil.example",
+            "ip": "192.0.2.1",
+            "locale": "en",
+            "account": {"acct": "spam"},
+        },
+        mastodon_username="mod",
+    )
+    assert "Approved: yes" in text
+    assert "Handled by mod: Force approved account" in text
+
+
+async def test_run_action_handles_mastodon_api_error_message() -> None:
+    from mastodon_admin_bot.mastodon.client import MastodonApiError
+
+    async def fail() -> None:
+        raise MastodonApiError(422, "already rejected")
+
+    message = await _run_action(fail)
+    assert message == "Mastodon rejected action: already rejected"

@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     )
     database_url: str = Field(default="sqlite+aiosqlite:///./bot.db", alias="DATABASE_URL")
     token_encryption_key: SecretStr = Field(alias="TOKEN_ENCRYPTION_KEY")
+    autoban_default_reject_after_seconds: int = Field(
+        default=43200,
+        alias="AUTOBAN_DEFAULT_REJECT_AFTER_SECONDS",
+    )
 
     @field_validator(
         "trusted_telegram_user_ids",

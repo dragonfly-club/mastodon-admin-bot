@@ -7,7 +7,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.migrations import upgrade_database
-from mastodon_admin_bot.storage.models import OAuthState, TelegramMessageMapping
+from mastodon_admin_bot.storage.models import (
+    OAuthState,
+    PendingAccount,
+    TelegramMessageMapping,
+)
 from mastodon_admin_bot.storage.repository import Repository, create_engine
 
 
@@ -147,4 +151,184 @@ async def test_schema_only_contains_oauth_and_message_mappings() -> None:
         mappings = list(await session.scalars(select(TelegramMessageMapping)))
 
     assert mappings == []
+    await engine.dispose()
+
+
+async def test_blocklist_rule_round_trip() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    rule, created = await repo.add_blocklist_rule(
+        rule_type="email", pattern=r"^spam@.*$", created_by=111
+    )
+    assert created is True
+    assert rule.rule_type == "email"
+    assert rule.pattern == r"^spam@.*$"
+    assert rule.created_by == 111
+
+    duplicate, created_again = await repo.add_blocklist_rule(
+        rule_type="email", pattern=r"^spam@.*$", created_by=222
+    )
+    assert created_again is False
+    assert duplicate.id == rule.id
+    assert duplicate.created_by == 111
+
+    rules = await repo.list_blocklist_rules()
+    assert [r.pattern for r in rules] == [r"^spam@.*$"]
+
+    domain, _ = await repo.add_blocklist_rule(rule_type="email_domain", pattern="evil")
+    listed = await repo.list_blocklist_rules(rule_type="email_domain")
+    assert [r.pattern for r in listed] == ["evil"]
+    assert [r.pattern for r in await repo.list_blocklist_rules(rule_type="email")] == [
+        r"^spam@.*$"
+    ]
+
+    removed = await repo.remove_blocklist_rule(rule_type="email", pattern=r"^spam@.*$")
+    assert removed == 1
+    assert await repo.list_blocklist_rules(rule_type="email") == []
+    assert [r.pattern for r in await repo.list_blocklist_rules()] == ["evil"]
+    await engine.dispose()
+
+
+async def test_pending_account_upsert_does_not_reset_state() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    pending = await repo.upsert_pending_account(
+        account_id="42",
+        account_snapshot='{"email":"a@b"}',
+        matched_rule_type="email",
+        matched_pattern="a@b",
+        auto_reject_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    assert pending.state == "pending"
+
+    await repo.mark_pending_account_handled(
+        account_id="42", state="rejected", handled_by="mod"
+    )
+    again = await repo.upsert_pending_account(
+        account_id="42",
+        account_snapshot='{"email":"a@b"}',
+    )
+    assert again.state == "rejected"
+    assert again.handled_by == "mod"
+    await engine.dispose()
+
+
+async def test_list_due_pending_auto_bans_returns_only_due_pending() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    now = datetime.now(UTC)
+
+    async with repo.sessionmaker() as session:
+        session.add_all(
+            [
+                PendingAccount(
+                    account_id="due",
+                    account_snapshot="{}",
+                    auto_reject_at=now - timedelta(minutes=1),
+                    state="pending",
+                ),
+                PendingAccount(
+                    account_id="future",
+                    account_snapshot="{}",
+                    auto_reject_at=now + timedelta(hours=1),
+                    state="pending",
+                ),
+                PendingAccount(
+                    account_id="already",
+                    account_snapshot="{}",
+                    auto_reject_at=now - timedelta(minutes=5),
+                    state="rejected",
+                ),
+                PendingAccount(
+                    account_id="nomatch",
+                    account_snapshot="{}",
+                    auto_reject_at=None,
+                    state="pending",
+                ),
+            ]
+        )
+        await session.commit()
+
+    due = await repo.list_due_pending_auto_bans(now)
+    assert [p.account_id for p in due] == ["due"]
+    await engine.dispose()
+
+
+async def test_app_settings_round_trip() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await repo.get_setting("missing") is None
+    assert await repo.get_setting("missing", "fallback") == "fallback"
+
+    await repo.set_setting("autoban_reject_after_seconds", "600")
+    assert await repo.get_setting("autoban_reject_after_seconds") == "600"
+    await repo.set_setting("autoban_reject_after_seconds", "1200")
+    assert await repo.get_setting("autoban_reject_after_seconds") == "1200"
+    await engine.dispose()
+
+
+async def test_autoban_timeout_default_and_override() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await repo.get_autoban_timeout_seconds(default=43200) == 43200
+    await repo.set_autoban_timeout_seconds(300)
+    assert await repo.get_autoban_timeout_seconds(default=43200) == 300
+    await repo.set_setting("autoban_reject_after_seconds", "not-a-number")
+    assert await repo.get_autoban_timeout_seconds(default=43200) == 43200
+    await engine.dispose()
+
+
+async def test_get_linked_moderator_token_prefers_requested_then_falls_back() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await repo.get_linked_moderator_token() is None
+    assert await repo.get_linked_moderator_token(preferred_telegram_user_id=999) is None
+
+    await repo.upsert_moderator_link(
+        telegram_user_id=111,
+        mastodon_account_id="a1",
+        mastodon_username="alice",
+        access_token="alice-token",
+        scopes="admin:write:accounts",
+    )
+    await repo.upsert_moderator_link(
+        telegram_user_id=222,
+        mastodon_account_id="a2",
+        mastodon_username="bob",
+        access_token="bob-token",
+        scopes="admin:write:accounts",
+    )
+
+    preferred = await repo.get_linked_moderator_token(preferred_telegram_user_id=222)
+    assert preferred is not None
+    token, username = preferred
+    assert token == "bob-token"
+    assert username == "bob"
+
+    fallback = await repo.get_linked_moderator_token(preferred_telegram_user_id=999)
+    assert fallback is not None
+    token, username = fallback
+    assert token in {"alice-token", "bob-token"}
+    assert username in {"alice", "bob"}
+    await engine.dispose()
+
+
+async def test_migrations_create_new_tables(tmp_path: Path) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'bot.db'}"
+    await upgrade_database(database_url)
+    repo, engine = make_repo(database_url)
+
+    rule, created = await repo.add_blocklist_rule(rule_type="reason", pattern="spam")
+    assert created is True
+    pending = await repo.upsert_pending_account(
+        account_id="9", account_snapshot='{"reason":"spam"}'
+    )
+    assert pending.state == "pending"
+    await repo.set_autoban_timeout_seconds(120)
+    assert await repo.get_autoban_timeout_seconds(default=43200) == 120
     await engine.dispose()

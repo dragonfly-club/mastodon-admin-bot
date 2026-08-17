@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiogram import Bot
@@ -9,13 +10,26 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup
 from aiohttp import web
 
+from mastodon_admin_bot.autoban import (
+    AutobanInfo,
+    find_match,
+    render_auto_reject_at_line,
+    render_match_line,
+    snapshot_account,
+    snapshot_to_json,
+)
 from mastodon_admin_bot.config import Settings
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.client import MastodonClient
 from mastodon_admin_bot.mastodon.webhooks import is_pending_local_account, parse_webhook_payload
 from mastodon_admin_bot.security import verify_mastodon_signature
 from mastodon_admin_bot.storage.repository import Repository
-from mastodon_admin_bot.telegram.keyboards import account_keyboard, open_keyboard, report_keyboard
+from mastodon_admin_bot.telegram.keyboards import (
+    account_keyboard,
+    autoban_keyboard,
+    open_keyboard,
+    report_keyboard,
+)
 from mastodon_admin_bot.telegram.render import (
     render_account_event,
     render_report_event,
@@ -54,8 +68,11 @@ def build_routes(
             return web.json_response({"error": str(exc)}, status=400)
 
         object_type = _object_type_for_event(event.event)
-        if object_type is None or event.object_id is None:
+        object_id = event.object_id
+        if object_type is None or object_id is None:
             return web.json_response({"ok": True, "ignored": True})
+
+        autoban = await _maybe_build_autoban_info(repository, event, object_id, settings)
 
         failed_chat_ids: list[int] = []
         if settings.telegram_home_chat_ids:
@@ -66,10 +83,11 @@ def build_routes(
                     webhook_locks=webhook_locks,
                     chat_id=chat_id,
                     object_type=object_type,
-                    object_id=event.object_id,
+                    object_id=object_id,
                     event_name=event.event,
                     obj=event.object,
                     mastodon_origin=settings.mastodon_origin,
+                    autoban=autoban,
                 )
                 if failed:
                     failed_chat_ids.append(chat_id)
@@ -124,6 +142,51 @@ def build_routes(
     return routes
 
 
+async def _maybe_build_autoban_info(
+    repository: Repository,
+    event: Any,
+    object_id: str,
+    settings: Settings,
+) -> AutobanInfo | None:
+    if event.event != "account.created" or not is_pending_local_account(event.object):
+        return None
+    snapshot = snapshot_account(event.object)
+    match = await find_match(repository, event.object)
+    timeout_seconds = await repository.get_autoban_timeout_seconds(
+        settings.autoban_default_reject_after_seconds
+    )
+    auto_reject_at: datetime | None = None
+    matched_rule_type: str | None = None
+    matched_pattern: str | None = None
+    matched_rule_created_by: int | None = None
+    if match is not None:
+        auto_reject_at = datetime.now(UTC) + timedelta(seconds=timeout_seconds)
+        matched_rule_type = match.rule_type
+        matched_pattern = match.pattern
+        matched_rule_created_by = match.created_by
+    pending = await repository.upsert_pending_account(
+        account_id=object_id,
+        account_snapshot=snapshot_to_json(snapshot),
+        matched_rule_type=matched_rule_type,
+        matched_pattern=matched_pattern,
+        matched_rule_created_by=matched_rule_created_by,
+        auto_reject_at=auto_reject_at,
+    )
+    return AutobanInfo(
+        matched_rule_type=pending.matched_rule_type,
+        matched_pattern=pending.matched_pattern,
+        auto_reject_at=_ensure_aware(pending.auto_reject_at),
+    )
+
+
+def _ensure_aware(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
 async def _send_event_message(
     *,
     bot: Bot,
@@ -131,8 +194,9 @@ async def _send_event_message(
     event_name: str,
     obj: dict[str, Any],
     mastodon_origin: str,
+    autoban: AutobanInfo | None = None,
 ) -> Any:
-    text, keyboard = _render_event_message(event_name, obj, mastodon_origin)
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban)
     return await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -153,6 +217,7 @@ async def _deliver_event_to_chat(
     event_name: str,
     obj: dict[str, Any],
     mastodon_origin: str,
+    autoban: AutobanInfo | None = None,
 ) -> bool:
     lock_key = _webhook_lock_key(object_type, object_id, chat_id)
     try:
@@ -171,6 +236,7 @@ async def _deliver_event_to_chat(
                     event_name=event_name,
                     obj=obj,
                     mastodon_origin=mastodon_origin,
+                    autoban=autoban,
                 )
                 await repository.upsert_message_mapping(
                     object_type=object_type,
@@ -186,6 +252,7 @@ async def _deliver_event_to_chat(
                     event_name=event_name,
                     obj=obj,
                     mastodon_origin=mastodon_origin,
+                    autoban=autoban,
                 )
     except TelegramAPIError as exc:
         if _is_message_not_modified(exc):
@@ -203,8 +270,9 @@ async def _edit_event_message(
     event_name: str,
     obj: dict[str, Any],
     mastodon_origin: str,
+    autoban: AutobanInfo | None = None,
 ) -> Any:
-    text, keyboard = _render_event_message(event_name, obj, mastodon_origin)
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban)
     return await bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
@@ -219,12 +287,31 @@ def _render_event_message(
     event_name: str,
     obj: dict[str, Any],
     mastodon_origin: str,
+    autoban: AutobanInfo | None = None,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     if event_name == "account.created":
         text = render_account_event(event_name, obj)
         account_id = str(obj.get("id"))
         url = f"{mastodon_origin}/admin/accounts/{account_id}" if account_id else None
-        keyboard = account_keyboard(account_id, url) if is_pending_local_account(obj) else None
+        if is_pending_local_account(obj):
+            keyboard: InlineKeyboardMarkup | None
+            if (
+                autoban is not None
+                and autoban.matched_rule_type is not None
+                and autoban.matched_pattern is not None
+                and autoban.auto_reject_at is not None
+            ):
+                text = (
+                    text
+                    + "\n"
+                    + render_match_line(autoban.matched_rule_type, autoban.matched_pattern)
+                )
+                text = text + "\n" + render_auto_reject_at_line(autoban.auto_reject_at)
+                keyboard = autoban_keyboard(account_id)
+            else:
+                keyboard = account_keyboard(account_id, url)
+        else:
+            keyboard = None
     elif event_name == "report.created":
         text = render_report_event(obj)
         report_id = str(obj.get("id"))
