@@ -140,6 +140,10 @@ async def _register_bot_commands(bot: Bot) -> None:
             command="autobantimeout",
             description="Show or set the auto-reject timeout (seconds)",
         ),
+        BotCommand(
+            command="notifyblockeduser",
+            description="Show or set notifications for auto-blocked accounts (on|off)",
+        ),
     ]
     try:
         await bot.set_my_commands(commands)

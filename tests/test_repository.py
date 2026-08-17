@@ -261,6 +261,40 @@ async def test_list_due_pending_auto_bans_returns_only_due_matched() -> None:
     await engine.dispose()
 
 
+async def test_notify_blocked_users_setting_defaults_off_and_round_trips() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await repo.get_notify_blocked_users_enabled() is False
+    await repo.set_notify_blocked_users_enabled(True)
+    assert await repo.get_notify_blocked_users_enabled() is True
+    await repo.set_notify_blocked_users_enabled(False)
+    assert await repo.get_notify_blocked_users_enabled() is False
+    await engine.dispose()
+
+
+async def test_delete_message_mapping() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await repo.delete_message_mapping(
+        object_type="account", object_id="1", chat_id=10
+    ) is False
+    await repo.upsert_message_mapping(
+        object_type="account", object_id="1", chat_id=10, message_id=100
+    )
+    assert await repo.delete_message_mapping(
+        object_type="account", object_id="1", chat_id=10
+    ) is True
+    assert (
+        await repo.get_message_mapping(
+            object_type="account", object_id="1", chat_id=10
+        )
+        is None
+    )
+    await engine.dispose()
+
+
 async def test_app_settings_round_trip() -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)

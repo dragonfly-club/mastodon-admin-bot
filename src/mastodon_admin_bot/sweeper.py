@@ -62,10 +62,9 @@ async def _auto_reject_one(
         )
         return False
     token, username = token_data
-    api_result: dict[str, Any] | None
     try:
         async with MastodonClient(mastodon_origin, token=token) as client:
-            api_result = await client.reject_account(pending.account_id)
+            await client.reject_account(pending.account_id)
     except MastodonApiError as exc:
         if exc.status_code in (404, 422):
             await repository.mark_pending_account_handled(
@@ -78,7 +77,7 @@ async def _auto_reject_one(
                 repository=repository,
                 pending=pending,
                 username=username,
-                api_result=None,
+                rejected_account=None,
             )
         else:
             await repository.mark_pending_account_handled(
@@ -112,9 +111,28 @@ async def _auto_reject_one(
         repository=repository,
         pending=pending,
         username=username,
-        api_result=api_result,
+        rejected_account=_rejected_account_from_snapshot(pending),
     )
     return True
+
+
+def _rejected_account_from_snapshot(pending: PendingAccount) -> dict[str, Any]:
+    # The Mastodon reject API response does not reliably include the account's
+    # display fields, so render the updated message from the stored snapshot.
+    snapshot = snapshot_from_json(pending.account_snapshot)
+    account: dict[str, Any] = {}
+    acct = snapshot.get("acct", "")
+    if acct:
+        account = {"acct": acct}
+    return {
+        "id": pending.account_id,
+        "approved": False,
+        "email": snapshot.get("email", ""),
+        "ip": snapshot.get("ip", ""),
+        "locale": snapshot.get("locale", ""),
+        "account": account,
+        "invite_request": snapshot.get("reason", ""),
+    }
 
 
 async def _update_messages_after_auto_reject(
@@ -123,7 +141,7 @@ async def _update_messages_after_auto_reject(
     repository: Repository,
     pending: PendingAccount,
     username: str,
-    api_result: dict[str, Any] | None,
+    rejected_account: dict[str, Any] | None,
 ) -> None:
     snapshot = snapshot_from_json(pending.account_snapshot)
     include_reason = bool(snapshot.get("reason"))
@@ -134,8 +152,8 @@ async def _update_messages_after_auto_reject(
     )
     for mapping in mappings:
         try:
-            if api_result is not None:
-                text = render_account_event("account.rejected", api_result) + suffix
+            if rejected_account is not None:
+                text = render_account_event("account.rejected", rejected_account) + suffix
                 await bot.edit_message_text(
                     chat_id=mapping.chat_id,
                     message_id=mapping.message_id,

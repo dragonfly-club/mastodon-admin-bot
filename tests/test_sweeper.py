@@ -133,13 +133,21 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
     await _seed_moderator(repo)
-    await _seed_pending(repo, account_id="1")
+    await _seed_pending(
+        repo,
+        account_id="1",
+        snapshot=(
+            '{"email":"spam@evil.example","reason":"buy crypto",'
+            '"acct":"spam","ip":"192.0.2.1","locale":"en"}'
+        ),
+    )
     await repo.upsert_message_mapping(
         object_type="account", object_id="1", chat_id=10, message_id=100
     )
 
     clients: list[FakeMastodonClient] = []
-    _patch_mastodon_client(monkeypatch, capture_clients=clients)
+    # The API response is empty: the message must still render from the snapshot.
+    _patch_mastodon_client(monkeypatch, capture_clients=clients, reject_result={})
 
     bot = FakeBot()
     processed = await auto_reject_due_accounts(
@@ -158,6 +166,10 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
     assert "alice" in refreshed.handled_by
     assert len(bot.edited_text) == 1
     assert "Auto-rejected by bot (alice)" in bot.edited_text[0]["text"]
+    assert "spam@evil.example" in bot.edited_text[0]["text"]
+    assert "@spam" in bot.edited_text[0]["text"]
+    assert "192.0.2.1" in bot.edited_text[0]["text"]
+    assert "unknown" not in bot.edited_text[0]["text"]
     markup = bot.edited_text[0]["reply_markup"]
     texts = [b.text for row in markup.inline_keyboard for b in row]
     assert texts == ["Block Email", "Block Domain", "Block Reason"]

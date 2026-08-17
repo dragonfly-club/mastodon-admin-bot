@@ -38,6 +38,8 @@ class AutobanInfo:
     matched_rule_type: str | None = None
     matched_pattern: str | None = None
     auto_reject_at: datetime | None = None
+    # Whether the notification for this account should be delivered silently.
+    silent: bool = True
 
 
 def rule_type_label(rule_type: str) -> str:

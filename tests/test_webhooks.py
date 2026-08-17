@@ -299,6 +299,23 @@ async def test_autoban_matched_account_message_is_sent_silently() -> None:
     assert bot.sent_kwargs[-1]["disable_notification"] is True
 
 
+async def test_notify_enabled_autoban_account_message_triggers_notification() -> None:
+    bot = FakeBot()
+    bot.allow_send.set()
+    await _send_event_message(
+        bot=cast(Any, bot),
+        chat_id=10,
+        event_name="account.created",
+        obj={"id": "123", "approved": False, "email": "spam@evil.example"},
+        mastodon_origin="https://mastodon.example",
+        autoban=AutobanInfo(
+            matched_rule_type="email", matched_pattern=r"^spam@.*$", silent=False
+        ),
+    )
+
+    assert bot.sent_kwargs[-1]["disable_notification"] is False
+
+
 async def test_unmatched_account_message_is_sent_with_notification() -> None:
     bot = FakeBot()
     bot.allow_send.set()
@@ -311,6 +328,78 @@ async def test_unmatched_account_message_is_sent_with_notification() -> None:
     )
 
     assert bot.sent_kwargs[-1]["disable_notification"] is False
+
+
+async def test_redelivered_created_event_for_handled_account_does_not_resend() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(
+        account_id="123",
+        account_snapshot='{"email":"spam@evil.example"}',
+        matched_rule_type="email",
+        matched_pattern="spam@",
+    )
+    await repo.mark_pending_account_handled(
+        account_id="123", state="auto_rejected", handled_by="auto (mod)"
+    )
+
+    bot = FakeBot()
+    bot.allow_send.set()
+    failed = await _deliver_event_to_chat(
+        repository=repo,
+        bot=cast(Any, bot),
+        webhook_locks=KeyedAsyncLocks(),
+        chat_id=10,
+        object_type="account",
+        object_id="123",
+        event_name="account.created",
+        obj={"id": "123", "approved": False, "email": "spam@evil.example", "domain": None},
+        mastodon_origin="https://mastodon.example",
+    )
+
+    assert failed is False
+    assert bot.sent == []
+    await engine.dispose()
+
+
+async def test_stale_mapping_edit_not_found_resends_fresh_message() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_message_mapping(
+        object_type="account",
+        object_id="123",
+        chat_id=10,
+        message_id=999,
+    )
+
+    bot = FakeBot()
+    bot.allow_send.set()
+    bot.edit_error = TelegramBadRequest(
+        method=EditMessageText(text="x"),
+        message="Bad Request: message to edit not found",
+    )
+
+    failed = await _deliver_event_to_chat(
+        repository=repo,
+        bot=cast(Any, bot),
+        webhook_locks=KeyedAsyncLocks(),
+        chat_id=10,
+        object_type="account",
+        object_id="123",
+        event_name="account.created",
+        obj={"id": "123", "approved": False, "email": "spam@evil.example", "domain": None},
+        mastodon_origin="https://mastodon.example",
+    )
+
+    assert failed is False
+    assert len(bot.sent) == 1
+    assert bot.sent[0][0] == 10
+    mapping = await repo.get_message_mapping(
+        object_type="account", object_id="123", chat_id=10
+    )
+    assert mapping is not None
+    assert mapping.message_id != 999
+    await engine.dispose()
 
 
 async def test_concurrent_duplicate_webhook_delivery_sends_once() -> None:

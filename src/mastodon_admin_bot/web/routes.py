@@ -168,6 +168,7 @@ async def _maybe_build_autoban_info(
     )
     if pending.matched_rule_type is None:
         return AutobanInfo()
+    notify_enabled = await repository.get_notify_blocked_users_enabled()
     timeout_seconds = await repository.get_autoban_timeout_seconds(
         settings.autoban_default_reject_after_seconds
     )
@@ -175,6 +176,7 @@ async def _maybe_build_autoban_info(
         matched_rule_type=pending.matched_rule_type,
         matched_pattern=pending.matched_pattern,
         auto_reject_at=datetime.now(UTC) + timedelta(seconds=timeout_seconds),
+        silent=not notify_enabled,
     )
 
 
@@ -194,12 +196,8 @@ async def _send_event_message(
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
         disable_web_page_preview=True,
-        disable_notification=_is_silent_autoban(autoban),
+        disable_notification=autoban is not None and autoban.silent,
     )
-
-
-def _is_silent_autoban(autoban: AutobanInfo | None) -> bool:
-    return autoban is not None and autoban.matched_rule_type is not None
 
 
 async def _deliver_event_to_chat(
@@ -226,6 +224,10 @@ async def _deliver_event_to_chat(
             if mapping is None:
                 if not _should_send_new_message(event_name, obj):
                     return False
+                if await _account_already_handled(repository, object_type, object_id):
+                    # No live message for this object and the account was already
+                    # decided: do not (re)send a stale notification with buttons.
+                    return False
                 message = await _send_event_message(
                     bot=bot,
                     chat_id=chat_id,
@@ -241,21 +243,68 @@ async def _deliver_event_to_chat(
                     message_id=message.message_id,
                 )
             else:
-                await _edit_event_message(
-                    bot=bot,
-                    chat_id=chat_id,
-                    message_id=mapping.message_id,
-                    event_name=event_name,
-                    obj=obj,
-                    mastodon_origin=mastodon_origin,
-                    autoban=autoban,
-                )
+                try:
+                    await _edit_event_message(
+                        bot=bot,
+                        chat_id=chat_id,
+                        message_id=mapping.message_id,
+                        event_name=event_name,
+                        obj=obj,
+                        mastodon_origin=mastodon_origin,
+                        autoban=autoban,
+                    )
+                except TelegramAPIError as exc:
+                    if not _is_message_not_found(exc):
+                        raise
+                    # The mapped message is gone: drop the stale mapping and, if
+                    # this event is still worth notifying about, send a fresh one.
+                    await repository.delete_message_mapping(
+                        object_type=object_type,
+                        object_id=object_id,
+                        chat_id=chat_id,
+                    )
+                    if not _should_send_new_message(event_name, obj):
+                        return False
+                    if await _account_already_handled(repository, object_type, object_id):
+                        return False
+                    message = await _send_event_message(
+                        bot=bot,
+                        chat_id=chat_id,
+                        event_name=event_name,
+                        obj=obj,
+                        mastodon_origin=mastodon_origin,
+                        autoban=autoban,
+                    )
+                    await repository.upsert_message_mapping(
+                        object_type=object_type,
+                        object_id=object_id,
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                    )
     except TelegramAPIError as exc:
         if _is_message_not_modified(exc):
             return False
         # Keep the existing mapping; a later webhook can retry the edit.
         return True
     return False
+
+
+async def _account_already_handled(
+    repository: Repository,
+    object_type: str,
+    object_id: str,
+) -> bool:
+    if object_type != "account":
+        return False
+    pending = await repository.get_pending_account(object_id)
+    return pending is not None and pending.state != "pending"
+
+
+def _is_message_not_found(exc: TelegramAPIError) -> bool:
+    return (
+        isinstance(exc, TelegramBadRequest)
+        and "message to edit not found" in exc.message.lower()
+    )
 
 
 async def _edit_event_message(

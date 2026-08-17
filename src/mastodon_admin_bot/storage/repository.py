@@ -168,6 +168,27 @@ class Repository:
                 ),
             )
 
+    async def delete_message_mapping(
+        self,
+        *,
+        object_type: str,
+        object_id: str,
+        chat_id: int,
+    ) -> bool:
+        async with self.sessionmaker() as session:
+            mapping = await session.scalar(
+                select(TelegramMessageMapping).where(
+                    TelegramMessageMapping.object_type == object_type,
+                    TelegramMessageMapping.object_id == object_id,
+                    TelegramMessageMapping.chat_id == chat_id,
+                )
+            )
+            if mapping is None:
+                return False
+            await session.delete(mapping)
+            await session.commit()
+            return True
+
     async def upsert_message_mapping(
         self,
         *,
@@ -356,6 +377,12 @@ class Repository:
             else:
                 existing.value = value
             await session.commit()
+
+    async def get_notify_blocked_users_enabled(self) -> bool:
+        return (await self.get_setting("notify_blocked_users")) == "on"
+
+    async def set_notify_blocked_users_enabled(self, enabled: bool) -> None:
+        await self.set_setting("notify_blocked_users", "on" if enabled else "off")
 
     async def get_autoban_timeout_seconds(self, default: int) -> int:
         raw = await self.get_setting("autoban_reject_after_seconds")

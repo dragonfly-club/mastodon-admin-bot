@@ -117,12 +117,6 @@ def build_router(
             f"Authorize Mastodon access:\n{settings.mastodon_origin}/oauth/authorize?{params}"
         )
 
-    async def _require_private(message: Message) -> bool:
-        if not _is_private_chat(message.chat.type):
-            await message.answer("Please DM this bot and run that command there.")
-            return False
-        return True
-
     def _trusted_user_id(message: Message) -> int | None:
         user_id = message.from_user.id if message.from_user else None
         if not is_trusted_user(user_id) or user_id is None:
@@ -133,14 +127,6 @@ def build_router(
         user_id = _trusted_user_id(message)
         if user_id is None:
             await message.answer("This bot is restricted to trusted moderators.")
-            return None
-        return user_id
-
-    async def _gate_private_command(message: Message) -> int | None:
-        user_id = await _gate_management_command(message)
-        if user_id is None:
-            return None
-        if not await _require_private(message):
             return None
         return user_id
 
@@ -199,7 +185,7 @@ def build_router(
 
     @router.message(Command("autobantimeout"))
     async def autobantimeout(message: Message, command: CommandObject) -> None:
-        if await _gate_private_command(message) is None:
+        if await _gate_management_command(message) is None:
             return
         arg = (command.args or "").strip()
         if not arg:
@@ -222,6 +208,22 @@ def build_router(
         await message.answer(
             f"Auto-reject timeout set to {seconds}s ({_format_seconds(seconds)})."
         )
+
+    @router.message(Command("notifyblockeduser"))
+    async def notifyblockeduser(message: Message, command: CommandObject) -> None:
+        if await _gate_management_command(message) is None:
+            return
+        arg = (command.args or "").strip().lower()
+        if not arg:
+            current = await repository.get_notify_blocked_users_enabled()
+            state = "on" if current else "off (default)"
+            await message.answer(f"Notifications for auto-blocked accounts: {state}.")
+            return
+        if arg not in {"on", "off"}:
+            await message.answer("Usage: /notifyblockeduser on|off")
+            return
+        await repository.set_notify_blocked_users_enabled(arg == "on")
+        await message.answer(f"Notifications for auto-blocked accounts: {arg}.")
 
     @router.callback_query(AdminCallback.filter())
     async def admin_callback(
