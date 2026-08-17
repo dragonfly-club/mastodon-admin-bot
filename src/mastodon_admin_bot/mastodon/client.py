@@ -68,6 +68,17 @@ class MastodonClient:
         )
         return self._json_or_error(response)
 
+    async def verify_admin_access(self) -> None:
+        response = await self.client.get(
+            "/api/v1/admin/accounts",
+            headers=self._headers(),
+            params={"limit": 1},
+        )
+        if not response.is_success:
+            raise self._api_error(response)
+        if not isinstance(response.json(), list):
+            raise MastodonApiError(response.status_code, "unexpected admin API response")
+
     async def approve_account(self, account_id: str) -> dict[str, Any]:
         response = await self.client.post(
             f"/api/v1/admin/accounts/{account_id}/approve",
@@ -78,6 +89,20 @@ class MastodonClient:
     async def reject_account(self, account_id: str) -> dict[str, Any]:
         response = await self.client.post(
             f"/api/v1/admin/accounts/{account_id}/reject",
+            headers=self._headers(),
+        )
+        return self._json_or_error(response)
+
+    async def get_admin_account(self, account_id: str) -> dict[str, Any]:
+        response = await self.client.get(
+            f"/api/v1/admin/accounts/{account_id}",
+            headers=self._headers(),
+        )
+        return self._json_or_error(response)
+
+    async def get_admin_report(self, report_id: str) -> dict[str, Any]:
+        response = await self.client.get(
+            f"/api/v1/admin/reports/{report_id}",
             headers=self._headers(),
         )
         return self._json_or_error(response)

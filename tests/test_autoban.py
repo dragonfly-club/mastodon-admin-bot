@@ -163,3 +163,14 @@ async def test_find_match_skips_empty_field() -> None:
     match = await find_match(repo, {"account": {"acct": "x"}})
     assert match is None
     await engine.dispose()
+
+
+async def test_find_match_times_out_pathological_regex() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.add_blocklist_rule(rule_type=RULE_TYPE_REASON, pattern=r"^(a|aa)+$")
+
+    match = await find_match(repo, {"invite_request": "a" * 2000 + "!"})
+
+    assert match is None
+    await engine.dispose()

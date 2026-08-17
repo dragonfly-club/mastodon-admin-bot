@@ -1,12 +1,9 @@
-import asyncio
 from typing import Any, cast
 
-import httpx
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
 
-from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
 from mastodon_admin_bot.telegram.handlers import (
     _account_result_event,
@@ -22,8 +19,6 @@ from mastodon_admin_bot.telegram.handlers import (
     _pending_state_for_action,
     _post_action_markup,
     _render_blocklist,
-    _run_action,
-    _run_locked_action,
     _snapshot_has_reason,
 )
 from mastodon_admin_bot.telegram.keyboards import Action, AdminCallback
@@ -130,15 +125,6 @@ def test_action_result_text_shows_returned_account_approval() -> None:
     assert "Handled by mod: Approved account" in text
 
 
-async def test_action_http_failure_returns_retry_message() -> None:
-    async def fail() -> None:
-        raise httpx.ConnectError("temporary network failure")
-
-    message = await _run_action(fail)
-
-    assert message == "Mastodon action failed. Please retry."
-
-
 async def test_mark_current_message_ignores_message_not_modified() -> None:
     bot = FakeBot(
         TelegramBadRequest(
@@ -175,67 +161,6 @@ async def test_mark_current_message_swallows_other_telegram_edit_errors() -> Non
     )
 
     assert bot.edited[0]["message_id"] == 100
-
-
-async def test_action_lock_rejects_concurrent_conflicting_action() -> None:
-    locks = KeyedAsyncLocks()
-    handled_keys: set[str] = set()
-    started = asyncio.Event()
-    finish = asyncio.Event()
-    calls = 0
-
-    async def slow_action() -> None:
-        nonlocal calls
-        calls += 1
-        started.set()
-        await finish.wait()
-
-    first = asyncio.create_task(
-        _run_locked_action(locks, handled_keys, "account_decision:1", slow_action)
-    )
-    await started.wait()
-    second = await _run_locked_action(locks, handled_keys, "account_decision:1", slow_action)
-    finish.set()
-
-    assert second == "That moderation decision is already being handled."
-    assert await first is None
-    assert calls == 1
-
-
-async def test_action_lock_allows_retry_after_failure() -> None:
-    locks = KeyedAsyncLocks()
-    handled_keys: set[str] = set()
-    calls = 0
-
-    async def fail_once() -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise httpx.ConnectError("temporary network failure")
-
-    first = await _run_locked_action(locks, handled_keys, "report_state:1", fail_once)
-    second = await _run_locked_action(locks, handled_keys, "report_state:1", fail_once)
-
-    assert first == "Mastodon action failed. Please retry."
-    assert second is None
-    assert calls == 2
-
-
-async def test_successful_action_lock_blocks_later_duplicate() -> None:
-    locks = KeyedAsyncLocks()
-    handled_keys: set[str] = set()
-    calls = 0
-
-    async def succeed() -> None:
-        nonlocal calls
-        calls += 1
-
-    first = await _run_locked_action(locks, handled_keys, "report_state:1", succeed)
-    second = await _run_locked_action(locks, handled_keys, "report_state:1", succeed)
-
-    assert first is None
-    assert second == "That moderation decision was already handled."
-    assert calls == 1
 
 
 def test_action_lock_key_groups_conflicting_decisions() -> None:
@@ -385,13 +310,3 @@ def test_action_result_text_force_approve_renders_approved_account() -> None:
     )
     assert "Approved: yes" in text
     assert "Handled by mod: Force approved account" in text
-
-
-async def test_run_action_handles_mastodon_api_error_message() -> None:
-    from mastodon_admin_bot.mastodon.client import MastodonApiError
-
-    async def fail() -> None:
-        raise MastodonApiError(422, "already rejected")
-
-    message = await _run_action(fail)
-    assert message == "Mastodon rejected action: already rejected"

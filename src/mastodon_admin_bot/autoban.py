@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 from typing import TYPE_CHECKING, Any
 
+import regex
 from aiogram.utils.markdown import hcode
 
 if TYPE_CHECKING:
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from mastodon_admin_bot.storage.repository import Repository
 
 logger = logging.getLogger(__name__)
+REGEX_TIMEOUT_SECONDS = 0.1
+MAX_PATTERN_LENGTH = 1024
 
 RULE_TYPE_EMAIL = "email"
 RULE_TYPE_EMAIL_DOMAIN = "email_domain"
@@ -106,16 +108,28 @@ async def find_match(
             continue
         for rule in by_type[rule_type]:
             try:
-                compiled = re.compile(rule.pattern)
-            except re.error:
+                compiled = compile_rule_pattern(rule.pattern)
+            except regex.error:
                 logger.warning(
                     "Skipping invalid blocklist regex",
                     extra={"rule_type": rule.rule_type, "pattern": rule.pattern},
                 )
                 continue
-            if compiled.search(value):
-                return rule
+            try:
+                if compiled.search(value, timeout=REGEX_TIMEOUT_SECONDS):
+                    return rule
+            except TimeoutError:
+                logger.warning(
+                    "Blocklist regex timed out",
+                    extra={"rule_id": rule.id, "rule_type": rule.rule_type},
+                )
     return None
+
+
+def compile_rule_pattern(pattern: str) -> regex.Pattern[str]:
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        raise regex.error(f"pattern exceeds {MAX_PATTERN_LENGTH} characters")
+    return regex.compile(pattern)
 
 
 def render_match_line(rule_type: str, pattern: str) -> str:

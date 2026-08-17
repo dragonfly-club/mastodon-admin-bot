@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from html import escape
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+import regex
 from aiogram import Bot, Router
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -19,6 +20,7 @@ from mastodon_admin_bot.autoban import (
     RULE_TYPE_EMAIL,
     RULE_TYPE_EMAIL_DOMAIN,
     RULE_TYPE_REASON,
+    compile_rule_pattern,
     snapshot_from_json,
 )
 from mastodon_admin_bot.config import Settings
@@ -38,7 +40,6 @@ from .render import render_account_event, render_report_event
 
 logger = logging.getLogger(__name__)
 _ACTION_LOCKS = KeyedAsyncLocks()
-_HANDLED_ACTION_KEYS: set[str] = set()
 
 _ACCOUNT_DECISION_ACTIONS: frozenset[Action] = frozenset(
     {
@@ -67,7 +68,6 @@ def build_router(
     settings: Settings,
     repository: Repository,
     action_locks: KeyedAsyncLocks = _ACTION_LOCKS,
-    handled_action_keys: set[str] = _HANDLED_ACTION_KEYS,
 ) -> Router:
     router = Router(name=__name__)
 
@@ -243,7 +243,6 @@ def build_router(
                 repository=repository,
                 bot=bot,
                 action_locks=action_locks,
-                handled_action_keys=handled_action_keys,
             )
             return
 
@@ -257,23 +256,19 @@ def build_router(
             async with MastodonClient(settings.mastodon_origin, token=token) as client:
                 return await _execute_action(client, callback_data)
 
-        error_message, api_result = await _run_locked_action_result(
-            action_locks,
-            handled_action_keys,
-            _action_lock_key(callback_data),
-            execute_action,
+        error_message, api_result = await _run_durable_action_result(
+            repository=repository,
+            locks=action_locks,
+            callback_data=callback_data,
+            requested_by=user_id,
+            handled_by=mastodon_username,
+            execute=execute_action,
         )
         if error_message is not None:
             await query.answer(error_message, show_alert=True)
             return
 
         await query.answer("Done.")
-        if callback_data.action in _ACCOUNT_DECISION_ACTIONS:
-            await repository.mark_pending_account_handled(
-                account_id=callback_data.object_id,
-                state=_pending_state_for_action(callback_data.action),
-                handled_by=mastodon_username,
-            )
         if query.message and not isinstance(query.message, InaccessibleMessage):
             current_text = query.message.html_text or query.message.text or ""
             pending = await repository.get_pending_account(callback_data.object_id)
@@ -321,7 +316,6 @@ def build_router(
         repository: Repository,
         bot: Bot,
         action_locks: KeyedAsyncLocks,
-        handled_action_keys: set[str],
     ) -> None:
         rule_type = _BLOCK_ACTION_TO_RULE_TYPE[callback_data.action]
         snapshot_field = _BLOCK_ACTION_TO_SNAPSHOT_FIELD[callback_data.action]
@@ -338,7 +332,7 @@ def build_router(
                 f"{snapshot_field} not available for this account.", show_alert=True
             )
             return
-        pattern = "^" + re.escape(value) + "$"
+        pattern = "^" + regex.escape(value) + "$"
 
         async def execute() -> dict[str, Any]:
             rule, _created = await repository.add_blocklist_rule(
@@ -348,12 +342,12 @@ def build_router(
             )
             return {"rule_id": rule.id, "pattern": rule.pattern}
 
-        error_message, _result = await _run_locked_action_result(
-            action_locks,
-            handled_action_keys,
-            _action_lock_key(callback_data),
-            execute,
-        )
+        lock = await action_locks.try_acquire(_action_lock_key(callback_data))
+        if lock is None:
+            await query.answer("That rule is already being added.", show_alert=True)
+            return
+        async with lock:
+            error_message, _result = await _run_action_result(execute)
         if error_message is not None:
             await query.answer(error_message, show_alert=True)
             return
@@ -451,13 +445,6 @@ def _is_message_not_modified(exc: TelegramAPIError) -> bool:
     return isinstance(exc, TelegramBadRequest) and "message is not modified" in exc.message.lower()
 
 
-async def _run_action(
-    execute: Callable[[], Awaitable[Any]],
-) -> str | None:
-    error_message, _result = await _run_action_result(execute)
-    return error_message
-
-
 async def _run_action_result(
     execute: Callable[[], Awaitable[Any]],
 ) -> tuple[str | None, Any | None]:
@@ -473,32 +460,98 @@ async def _run_action_result(
     return None, result
 
 
-async def _run_locked_action(
+async def _run_durable_action_result(
+    *,
+    repository: Repository,
     locks: KeyedAsyncLocks,
-    handled_keys: set[str],
-    lock_key: str,
-    execute: Callable[[], Awaitable[Any]],
-) -> str | None:
-    error_message, _result = await _run_locked_action_result(locks, handled_keys, lock_key, execute)
-    return error_message
-
-
-async def _run_locked_action_result(
-    locks: KeyedAsyncLocks,
-    handled_keys: set[str],
-    lock_key: str,
+    callback_data: AdminCallback,
+    requested_by: int,
+    handled_by: str,
     execute: Callable[[], Awaitable[Any]],
 ) -> tuple[str | None, Any | None]:
-    lock = await locks.try_acquire(lock_key)
+    operation_key = _action_lock_key(callback_data)
+    lock = await locks.try_acquire(operation_key)
     if lock is None:
         return "That moderation decision is already being handled.", None
     async with lock:
-        if lock_key in handled_keys:
+        claim = await repository.claim_moderation_operation(
+            operation_key=operation_key,
+            action=callback_data.action.value,
+            object_type=_callback_mapping_object_type(callback_data),
+            object_id=callback_data.object_id,
+            target_id=callback_data.target_id,
+            requested_by=requested_by,
+            handled_by=handled_by,
+        )
+        if claim == "done":
             return "That moderation decision was already handled.", None
-        error_message, result = await _run_action_result(execute)
-        if error_message is None:
-            handled_keys.add(lock_key)
-        return error_message, result
+        if claim != "claimed":
+            return "That moderation decision is already being handled.", None
+        try:
+            result = await execute()
+        except MastodonApiError as exc:
+            uncertain = exc.status_code >= 500 or (
+                callback_data.action in _ACCOUNT_DECISION_ACTIONS
+                and exc.status_code in {403, 404, 422}
+            )
+            retry_after = None
+            if exc.status_code == 429:
+                operation = await repository.get_moderation_operation(operation_key)
+                attempts = operation.attempts if operation is not None else 1
+                retry_after = timedelta(seconds=min(30 * (2 ** (attempts - 1)), 3600))
+            await repository.fail_moderation_operation(
+                operation_key,
+                error=f"Mastodon HTTP {exc.status_code}: {exc.message}",
+                uncertain=uncertain,
+                retry_after=retry_after,
+            )
+            if uncertain:
+                return "Mastodon returned an uncertain result; the bot will reconcile it.", None
+            return f"Mastodon rejected action: {exc.message}", None
+        except httpx.HTTPError as exc:
+            await repository.fail_moderation_operation(
+                operation_key,
+                error=f"transport error: {type(exc).__name__}",
+                uncertain=True,
+            )
+            return "Mastodon action outcome is uncertain; the bot will reconcile it.", None
+        except (ValueError, KeyError) as exc:
+            await repository.fail_moderation_operation(
+                operation_key,
+                error=f"invalid response: {type(exc).__name__}",
+            )
+            return "Mastodon action failed. Please retry.", None
+        except Exception as exc:
+            logger.exception("Unexpected moderation action failure")
+            await repository.fail_moderation_operation(
+                operation_key,
+                error=f"unexpected error: {type(exc).__name__}",
+                uncertain=True,
+            )
+            return "Unexpected moderation action failure; reconciliation is pending.", None
+        try:
+            pending_state = (
+                _pending_state_for_action(callback_data.action)
+                if callback_data.action in _ACCOUNT_DECISION_ACTIONS
+                else None
+            )
+            await repository.complete_moderation_operation(
+                operation_key,
+                pending_state=pending_state,
+                handled_by=handled_by,
+            )
+        except Exception as exc:
+            logger.exception("Failed to persist successful moderation action")
+            try:
+                await repository.fail_moderation_operation(
+                    operation_key,
+                    error=f"persistence error: {type(exc).__name__}",
+                    uncertain=True,
+                )
+            except Exception:
+                logger.exception("Failed to persist uncertain moderation state")
+            return "Action succeeded but state synchronization is pending.", None
+        return None, result
 
 
 def _action_result_text(
@@ -687,8 +740,8 @@ async def _add_blocklist_command(
         await message.answer(f"Usage: /{command_name} &lt;regex&gt;")
         return
     try:
-        re.compile(arg)
-    except re.error as exc:
+        compile_rule_pattern(arg)
+    except regex.error as exc:
         await message.answer(f"Invalid regex: {escape(str(exc))}")
         return
     _rule, created = await repository.add_blocklist_rule(

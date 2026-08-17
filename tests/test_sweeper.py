@@ -9,15 +9,22 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from mastodon_admin_bot.mastodon.client import MastodonApiError
 from mastodon_admin_bot.security import TokenCipher
-from mastodon_admin_bot.storage.models import PendingAccount
+from mastodon_admin_bot.storage.models import ModerationOperation, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository, create_engine
-from mastodon_admin_bot.sweeper import _auto_reject_one, auto_reject_due_accounts
+from mastodon_admin_bot.sweeper import (
+    _auto_reject_one,
+    auto_reject_due_accounts,
+    reconcile_uncertain_operations,
+)
 
 _DEFAULT_TIMEOUT_SECONDS = 3600
 
 
 def _default_timeout() -> dict[str, Any]:
-    return {"default_reject_after_seconds": _DEFAULT_TIMEOUT_SECONDS}
+    return {
+        "default_reject_after_seconds": _DEFAULT_TIMEOUT_SECONDS,
+        "trusted_telegram_user_ids": {111, 222},
+    }
 
 
 _DEFAULT_REJECT_RESULT: dict[str, Any] = {
@@ -62,6 +69,16 @@ class FakeMastodonClient:
             raise self.reject_error
         return self.reject_result
 
+    async def get_admin_account(self, _account_id: str) -> dict[str, Any]:
+        if self.reject_error is not None:
+            raise self.reject_error
+        return self.reject_result
+
+    async def get_admin_report(self, _report_id: str) -> dict[str, Any]:
+        if self.reject_error is not None:
+            raise self.reject_error
+        return self.reject_result
+
 
 def _patch_mastodon_client(
     monkeypatch: Any,
@@ -100,7 +117,7 @@ async def _seed_pending(
     account_id: str,
     snapshot: str = '{"email":"spam@evil.example","reason":"buy crypto"}',
     age: timedelta = timedelta(hours=2),
-    matched_rule_created_by: int | None = None,
+    matched_rule_created_by: int | None = 111,
 ) -> None:
     async with repo.sessionmaker() as session:
         session.add(
@@ -221,7 +238,7 @@ async def test_auto_reject_network_error_leaves_pending_for_retry(
     await engine.dispose()
 
 
-async def test_auto_reject_already_handled_error_marks_auto_rejected(
+async def test_auto_reject_ambiguous_422_remains_pending(
     monkeypatch: Any,
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
@@ -244,16 +261,84 @@ async def test_auto_reject_already_handled_error_marks_auto_rejected(
         **_default_timeout(),
     )
 
-    assert processed == 1
+    assert processed == 0
     refreshed = await repo.get_pending_account("1")
     assert refreshed is not None
-    assert refreshed.state == "auto_rejected"
+    assert refreshed.state == "pending"
+    operation = await repo.get_moderation_operation("account_decision:1")
+    assert operation is not None
+    assert operation.status == "uncertain"
     assert bot.edited_text == []
+    assert bot.edited_markup == []
+    await engine.dispose()
+
+
+async def test_auto_reject_does_not_use_untrusted_rule_creator(monkeypatch: Any) -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1", matched_rule_created_by=111)
+    tokens: list[str] = []
+    _patch_mastodon_client(monkeypatch, capture_tokens=tokens)
+
+    processed = await auto_reject_due_accounts(
+        repository=repo,
+        bot=cast(Any, FakeBot()),
+        mastodon_origin="https://m.example",
+        default_reject_after_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        trusted_telegram_user_ids={222},
+    )
+
+    assert processed == 0
+    assert tokens == []
+    await engine.dispose()
+
+
+async def test_reconciliation_confirms_missing_account_was_rejected(monkeypatch: Any) -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
+    await repo.upsert_message_mapping(
+        object_type="account", object_id="1", chat_id=10, message_id=100
+    )
+    await repo.claim_moderation_operation(
+        operation_key="account_decision:1",
+        action="rn",
+        object_type="account",
+        object_id="1",
+        target_id=None,
+        requested_by=111,
+        handled_by="auto (alice)",
+    )
+    await repo.fail_moderation_operation(
+        "account_decision:1", error="ambiguous", uncertain=True
+    )
+    async with repo.sessionmaker() as session:
+        operation = await session.get(ModerationOperation, "account_decision:1")
+        assert operation is not None
+        operation.updated_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+    _patch_mastodon_client(
+        monkeypatch, reject_error=MastodonApiError(404, "Record not found")
+    )
+    bot = FakeBot()
+
+    reconciled = await reconcile_uncertain_operations(
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        trusted_telegram_user_ids={111},
+    )
+
+    assert reconciled == 1
+    pending = await repo.get_pending_account("1")
+    assert pending is not None and pending.state == "auto_rejected"
     assert len(bot.edited_markup) == 1
     await engine.dispose()
 
 
-async def test_auto_reject_permanent_client_error_marks_rejected_error(
+async def test_auto_reject_permanent_client_error_remains_pending(
     monkeypatch: Any,
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
@@ -273,12 +358,13 @@ async def test_auto_reject_permanent_client_error_marks_rejected_error(
         repository=repo,
         bot=cast(Any, bot),
         mastodon_origin="https://m.example",
+        trusted_telegram_user_ids={111},
     )
 
-    assert handled is True
+    assert handled is False
     refreshed = await repo.get_pending_account("1")
     assert refreshed is not None
-    assert refreshed.state == "rejected_error"
+    assert refreshed.state == "pending"
     await engine.dispose()
 
 
@@ -326,6 +412,7 @@ async def test_stored_timeout_shortening_makes_old_account_due(monkeypatch: Any)
         bot=cast(Any, bot),
         mastodon_origin="https://m.example",
         default_reject_after_seconds=43200,
+        trusted_telegram_user_ids={111},
     )
     assert processed == 0
     refreshed = await repo.get_pending_account("1")
@@ -339,6 +426,7 @@ async def test_stored_timeout_shortening_makes_old_account_due(monkeypatch: Any)
         bot=cast(Any, bot),
         mastodon_origin="https://m.example",
         default_reject_after_seconds=43200,
+        trusted_telegram_user_ids={111},
     )
     assert processed == 1
     refreshed = await repo.get_pending_account("1")

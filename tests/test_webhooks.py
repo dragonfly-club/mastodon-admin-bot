@@ -5,10 +5,18 @@ from typing import Any, cast
 import pytest
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from mastodon_admin_bot.app_state import (
+    AUTOBAN_SWEEPER_TASK_KEY,
+    MAINTENANCE_TASK_KEY,
+    POLLING_TASK_KEY,
+)
 from mastodon_admin_bot.autoban import AutobanInfo
+from mastodon_admin_bot.config import Settings
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.webhooks import (
     html_to_text,
@@ -29,6 +37,7 @@ from mastodon_admin_bot.web.routes import (
     _render_event_message,
     _send_event_message,
     _should_send_new_message,
+    build_routes,
 )
 
 
@@ -216,6 +225,59 @@ def test_largest_callback_payload_fits_telegram_limit() -> None:
     ).pack()
 
     assert len(callback.encode()) <= 64
+
+
+async def test_cancelled_lock_waiter_does_not_leak_key() -> None:
+    locks = KeyedAsyncLocks()
+    first = await locks.acquire("key")
+    waiter = asyncio.create_task(locks.acquire("key"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await first.release()
+
+    assert locks._locks == {}
+
+
+async def test_healthz_reports_background_task_failure() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    settings = Settings(
+        TELEGRAM_BOT_TOKEN="123:token",
+        MASTODON_BASE_URL="https://mastodon.example",
+        MASTODON_WEBHOOK_SECRET="secret",
+        MASTODON_CLIENT_ID="client",
+        MASTODON_CLIENT_SECRET="secret",
+        MASTODON_REDIRECT_URI="https://bot.example/oauth/callback",
+        TOKEN_ENCRYPTION_KEY=Fernet.generate_key().decode(),
+    )
+    app = web.Application()
+    app.add_routes(build_routes(settings, repo, cast(Any, FakeBot())))
+    blocker = asyncio.Event()
+    tasks = [asyncio.create_task(blocker.wait()) for _ in range(3)]
+    app[POLLING_TASK_KEY] = tasks[0]
+    app[AUTOBAN_SWEEPER_TASK_KEY] = tasks[1]
+    app[MAINTENANCE_TASK_KEY] = tasks[2]
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        response = await client.get("/healthz")
+        assert response.status == 200
+        assert (await response.json())["ok"] is True
+
+        tasks[1].cancel()
+        await asyncio.gather(tasks[1], return_exceptions=True)
+        response = await client.get("/healthz")
+        assert response.status == 503
+        body = await response.json()
+        assert body["components"]["autoban_sweeper"] is False
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await client.close()
+        await engine.dispose()
 
 
 def test_resolved_created_report_keeps_open_button_only() -> None:

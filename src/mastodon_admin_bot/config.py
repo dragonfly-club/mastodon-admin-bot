@@ -49,8 +49,10 @@ class Settings(BaseSettings):
     token_encryption_key: SecretStr = Field(alias="TOKEN_ENCRYPTION_KEY")
     autoban_default_reject_after_seconds: int = Field(
         default=43200,
+        ge=60,
         alias="AUTOBAN_DEFAULT_REJECT_AFTER_SECONDS",
     )
+    data_retention_days: int = Field(default=30, ge=1, alias="DATA_RETENTION_DAYS")
 
     @field_validator(
         "trusted_telegram_user_ids",

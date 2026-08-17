@@ -4,7 +4,8 @@ import asyncio
 import logging
 import sys
 from contextlib import suppress
-from typing import Any, cast
+from datetime import timedelta
+from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -13,7 +14,16 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.types import BotCommand
 from aiohttp import web
+from aiohttp.abc import AbstractAccessLogger
 
+from mastodon_admin_bot.app_state import (
+    AUTOBAN_SWEEPER_TASK_KEY,
+    BOT_KEY,
+    ENGINE_KEY,
+    MAINTENANCE_TASK_KEY,
+    POLLING_TASK_KEY,
+    REPOSITORY_KEY,
+)
 from mastodon_admin_bot.config import get_settings
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.migrations import upgrade_database
@@ -24,6 +34,33 @@ from mastodon_admin_bot.web.routes import build_routes
 
 logger = logging.getLogger(__name__)
 _SWEEPER_INTERVAL_SECONDS = 15
+_MAINTENANCE_INTERVAL_SECONDS = 86400
+
+
+class PathOnlyAccessLogger(AbstractAccessLogger):
+    def log(self, request: web.BaseRequest, response: web.StreamResponse, time: float) -> None:
+        self.logger.info(
+            '%s "%s %s" %s %.3fs',
+            request.remote or "-",
+            request.method,
+            request.path,
+            response.status,
+            time,
+        )
+
+
+def _log_unexpected_task_exit(name: str, task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is None:
+        logger.error("Background task exited unexpectedly", extra={"task": name})
+    else:
+        logger.error(
+            "Background task crashed",
+            exc_info=(type(error), error, error.__traceback__),
+            extra={"task": name},
+        )
 
 
 def build_bot() -> Bot:
@@ -52,9 +89,9 @@ def create_app() -> web.Application:
     dispatcher.include_router(build_router(settings, repository))
 
     app = web.Application()
-    app["engine"] = engine
-    app["repository"] = repository
-    app["bot"] = bot
+    app[ENGINE_KEY] = engine
+    app[REPOSITORY_KEY] = repository
+    app[BOT_KEY] = bot
 
     async def init_db(_app: web.Application) -> None:
         await upgrade_database(settings.database_url)
@@ -63,13 +100,15 @@ def create_app() -> web.Application:
     async def start_polling(_app: web.Application) -> None:
         await bot.delete_webhook(drop_pending_updates=False)
         await _register_bot_commands(bot)
-        _app["polling_task"] = asyncio.create_task(
+        task = asyncio.create_task(
             dispatcher.start_polling(
                 bot,
                 handle_signals=False,
                 allowed_updates=dispatcher.resolve_used_update_types(),
             ),
         )
+        task.add_done_callback(lambda done: _log_unexpected_task_exit("polling", done))
+        _app[POLLING_TASK_KEY] = task
 
     async def start_autoban_sweeper(_app: web.Application) -> None:
         async def _loop() -> None:
@@ -82,22 +121,49 @@ def create_app() -> web.Application:
                         default_reject_after_seconds=(
                             settings.autoban_default_reject_after_seconds
                         ),
+                        trusted_telegram_user_ids=settings.trusted_telegram_user_ids,
                     )
                 except Exception:
                     logger.exception("Autoban sweeper iteration failed")
                 await asyncio.sleep(_SWEEPER_INTERVAL_SECONDS)
 
-        _app["autoban_sweeper_task"] = asyncio.create_task(_loop())
+        task = asyncio.create_task(_loop())
+        task.add_done_callback(lambda done: _log_unexpected_task_exit("autoban_sweeper", done))
+        _app[AUTOBAN_SWEEPER_TASK_KEY] = task
+
+    async def start_maintenance(_app: web.Application) -> None:
+        async def _loop() -> None:
+            while True:
+                try:
+                    removed = await repository.cleanup_expired_data(
+                        timedelta(days=settings.data_retention_days)
+                    )
+                    await repository.purge_oauth_states()
+                    if any(removed.values()):
+                        logger.info("Expired data removed", extra=removed)
+                except Exception:
+                    logger.exception("Maintenance iteration failed")
+                await asyncio.sleep(_MAINTENANCE_INTERVAL_SECONDS)
+
+        task = asyncio.create_task(_loop())
+        task.add_done_callback(lambda done: _log_unexpected_task_exit("maintenance", done))
+        _app[MAINTENANCE_TASK_KEY] = task
 
     async def stop_polling(_app: web.Application) -> None:
-        task = cast(asyncio.Task[Any], _app["polling_task"])
+        task = _app[POLLING_TASK_KEY]
         if not task.done():
             await dispatcher.stop_polling()
         with suppress(asyncio.CancelledError):
             await task
 
     async def stop_autoban_sweeper(_app: web.Application) -> None:
-        task = cast(asyncio.Task[Any], _app["autoban_sweeper_task"])
+        task = _app[AUTOBAN_SWEEPER_TASK_KEY]
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def stop_maintenance(_app: web.Application) -> None:
+        task = _app[MAINTENANCE_TASK_KEY]
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
@@ -108,8 +174,10 @@ def create_app() -> web.Application:
     app.on_startup.append(init_db)
     app.on_startup.append(start_polling)
     app.on_startup.append(start_autoban_sweeper)
+    app.on_startup.append(start_maintenance)
     app.on_cleanup.append(stop_polling)
     app.on_cleanup.append(stop_autoban_sweeper)
+    app.on_cleanup.append(stop_maintenance)
     app.on_cleanup.append(dispose)
     app.add_routes(build_routes(settings, repository, bot))
     return app
@@ -154,7 +222,12 @@ async def _register_bot_commands(bot: Bot) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     settings = get_settings()
-    web.run_app(create_app(), host=settings.bind_host, port=settings.bind_port)
+    web.run_app(
+        create_app(),
+        host=settings.bind_host,
+        port=settings.bind_port,
+        access_log_class=PathOnlyAccessLogger,
+    )
 
 
 if __name__ == "__main__":

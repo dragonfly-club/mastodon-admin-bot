@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.migrations import upgrade_database
 from mastodon_admin_bot.storage.models import (
+    ModerationOperation,
     OAuthState,
     PendingAccount,
     TelegramMessageMapping,
@@ -321,12 +323,11 @@ async def test_autoban_timeout_default_and_override() -> None:
     await engine.dispose()
 
 
-async def test_get_linked_moderator_token_prefers_requested_then_falls_back() -> None:
+async def test_get_moderator_token_requires_exact_identity() -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
 
-    assert await repo.get_linked_moderator_token() is None
-    assert await repo.get_linked_moderator_token(preferred_telegram_user_id=999) is None
+    assert await repo.get_moderator_token(999) is None
 
     await repo.upsert_moderator_link(
         telegram_user_id=111,
@@ -343,17 +344,14 @@ async def test_get_linked_moderator_token_prefers_requested_then_falls_back() ->
         scopes="admin:write:accounts",
     )
 
-    preferred = await repo.get_linked_moderator_token(preferred_telegram_user_id=222)
+    preferred = await repo.get_moderator_token(222)
     assert preferred is not None
     token, username = preferred
     assert token == "bob-token"
     assert username == "bob"
 
-    fallback = await repo.get_linked_moderator_token(preferred_telegram_user_id=999)
-    assert fallback is not None
-    token, username = fallback
-    assert token in {"alice-token", "bob-token"}
-    assert username in {"alice", "bob"}
+    fallback = await repo.get_moderator_token(999)
+    assert fallback is None
     await engine.dispose()
 
 
@@ -370,4 +368,122 @@ async def test_migrations_create_new_tables(tmp_path: Path) -> None:
     assert pending.state == "pending"
     await repo.set_autoban_timeout_seconds(120)
     assert await repo.get_autoban_timeout_seconds(default=43200) == 120
+    assert (
+        await repo.claim_moderation_operation(
+            operation_key="account_decision:9",
+            action="ao",
+            object_type="account",
+            object_id="9",
+            target_id=None,
+            requested_by=123,
+            handled_by="admin",
+        )
+        == "claimed"
+    )
+    await engine.dispose()
+
+
+async def test_oauth_state_claim_is_exclusive_and_link_consumes_it() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.create_oauth_state("state", 123)
+
+    assert await repo.claim_oauth_state("state") == 123
+    assert await repo.claim_oauth_state("state") is None
+    assert await repo.store_moderator_link_and_consume_state(
+        state="state",
+        telegram_user_id=123,
+        mastodon_account_id="account",
+        mastodon_username="admin",
+        access_token="token",
+        scopes="admin:write:accounts",
+    )
+    assert await repo.claim_oauth_state("state") is None
+    assert await repo.get_moderator_token(123) == ("token", "admin")
+    await engine.dispose()
+
+
+async def test_durable_operation_claim_blocks_duplicates_and_completes_pending() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(account_id="1", account_snapshot="{}")
+    async def claim() -> str:
+        return await repo.claim_moderation_operation(
+            operation_key="account_decision:1",
+            action="ao",
+            object_type="account",
+            object_id="1",
+            target_id=None,
+            requested_by=123,
+            handled_by="admin",
+        )
+
+    assert await claim() == "claimed"
+    assert await claim() == "busy"
+    await repo.complete_moderation_operation(
+        "account_decision:1", pending_state="approved", handled_by="admin"
+    )
+    assert await claim() == "done"
+    pending = await repo.get_pending_account("1")
+    assert pending is not None and pending.state == "approved"
+    await engine.dispose()
+
+
+async def test_durable_operation_claim_is_atomic_across_sessions(tmp_path: Path) -> None:
+    repo, engine = make_repo(f"sqlite+aiosqlite:///{tmp_path / 'claims.db'}")
+    await repo.create_schema(engine)
+
+    async def claim() -> str:
+        return await repo.claim_moderation_operation(
+            operation_key="account_decision:1",
+            action="ao",
+            object_type="account",
+            object_id="1",
+            target_id=None,
+            requested_by=123,
+            handled_by="admin",
+        )
+
+    results = await asyncio.gather(claim(), claim())
+
+    assert sorted(results) == ["busy", "claimed"]
+    await engine.dispose()
+
+
+async def test_cleanup_removes_expired_pii_mappings_and_operations() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(account_id="1", account_snapshot='{"email":"a@b"}')
+    await repo.mark_pending_account_handled(account_id="1", state="rejected")
+    await repo.upsert_message_mapping(
+        object_type="account", object_id="1", chat_id=10, message_id=20
+    )
+    await repo.claim_moderation_operation(
+        operation_key="account_decision:1",
+        action="an",
+        object_type="account",
+        object_id="1",
+        target_id=None,
+        requested_by=123,
+        handled_by="admin",
+    )
+    await repo.complete_moderation_operation("account_decision:1")
+    old = datetime.now(UTC) - timedelta(days=31)
+    async with repo.sessionmaker() as session:
+        pending = await session.scalar(
+            select(PendingAccount).where(PendingAccount.account_id == "1")
+        )
+        operation = await session.get(ModerationOperation, "account_decision:1")
+        assert pending is not None and operation is not None
+        pending.handled_at = old
+        operation.completed_at = old
+        await session.commit()
+
+    removed = await repo.cleanup_expired_data(timedelta(days=30))
+
+    assert removed == {"mappings": 1, "pending_accounts_scrubbed": 1, "operations": 1}
+    scrubbed = await repo.get_pending_account("1")
+    assert scrubbed is not None
+    assert scrubbed.state == "rejected"
+    assert scrubbed.account_snapshot == "{}"
     await engine.dispose()

@@ -11,7 +11,6 @@ class MastodonWebhook:
     event: str
     created_at: str | None
     object: dict[str, Any]
-    payload: dict[str, Any]
 
     @property
     def object_id(self) -> str | None:
@@ -31,7 +30,6 @@ def parse_webhook_payload(payload: dict[str, Any]) -> MastodonWebhook:
         event=event,
         created_at=created_at if isinstance(created_at, str) else None,
         object=obj,
-        payload=payload,
     )
 
 

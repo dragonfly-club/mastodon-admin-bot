@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup
 from aiohttp import web
 
+from mastodon_admin_bot.app_state import (
+    AUTOBAN_SWEEPER_TASK_KEY,
+    MAINTENANCE_TASK_KEY,
+    POLLING_TASK_KEY,
+)
 from mastodon_admin_bot.autoban import (
     AutobanInfo,
     find_match,
@@ -20,7 +27,7 @@ from mastodon_admin_bot.autoban import (
 )
 from mastodon_admin_bot.config import Settings
 from mastodon_admin_bot.locks import KeyedAsyncLocks
-from mastodon_admin_bot.mastodon.client import MastodonClient
+from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.mastodon.webhooks import is_pending_local_account, parse_webhook_payload
 from mastodon_admin_bot.security import verify_mastodon_signature
 from mastodon_admin_bot.storage.repository import Repository
@@ -36,6 +43,7 @@ from mastodon_admin_bot.telegram.render import (
 )
 
 _WEBHOOK_LOCKS = KeyedAsyncLocks()
+logger = logging.getLogger(__name__)
 
 
 def build_routes(
@@ -47,8 +55,26 @@ def build_routes(
     routes = web.RouteTableDef()
 
     @routes.get("/healthz")
-    async def healthz(_request: web.Request) -> web.Response:
-        return web.json_response({"ok": True})
+    async def healthz(request: web.Request) -> web.Response:
+        components: dict[str, bool] = {}
+        try:
+            await repository.check_database()
+            components["database"] = True
+        except Exception:
+            components["database"] = False
+        task_keys = (
+            ("polling", POLLING_TASK_KEY),
+            ("autoban_sweeper", AUTOBAN_SWEEPER_TASK_KEY),
+            ("maintenance", MAINTENANCE_TASK_KEY),
+        )
+        for name, key in task_keys:
+            task = request.app.get(key)
+            components[name] = task is not None and not task.done()
+        healthy = all(components.values())
+        return web.json_response(
+            {"ok": healthy, "components": components},
+            status=200 if healthy else 503,
+        )
 
     @routes.post("/mastodon/webhook")
     async def mastodon_webhook(request: web.Request) -> web.Response:
@@ -107,34 +133,46 @@ def build_routes(
         if not code or not state:
             return web.Response(text="Missing code or state", status=400)
 
-        telegram_user_id = await repository.consume_oauth_state(state)
+        telegram_user_id = await repository.claim_oauth_state(state)
         if telegram_user_id is None:
-            return web.Response(text="Invalid or expired OAuth state", status=400)
+            return web.Response(text="Invalid, expired, or already active OAuth state", status=400)
 
-        async with MastodonClient(settings.mastodon_origin) as client:
-            token_response = await client.exchange_oauth_code(
-                code=code,
-                client_id=settings.mastodon_client_id.get_secret_value(),
-                client_secret=settings.mastodon_client_secret.get_secret_value(),
-                redirect_uri=str(settings.mastodon_redirect_uri),
+        try:
+            async with MastodonClient(settings.mastodon_origin) as client:
+                token_response = await client.exchange_oauth_code(
+                    code=code,
+                    client_id=settings.mastodon_client_id.get_secret_value(),
+                    client_secret=settings.mastodon_client_secret.get_secret_value(),
+                    redirect_uri=str(settings.mastodon_redirect_uri),
+                )
+                access_token = str(token_response["access_token"])
+                scopes = str(token_response.get("scope") or "")
+            if not _scopes_cover(settings.mastodon_scopes, scopes):
+                raise ValueError("Mastodon granted fewer scopes than requested")
+            async with MastodonClient(settings.mastodon_origin, token=access_token) as user_client:
+                credentials = await user_client.verify_credentials()
+                await user_client.verify_admin_access()
+            account_id = credentials.get("id")
+            if account_id is None:
+                raise ValueError("Mastodon credentials response has no account ID")
+            mastodon_account_id = str(account_id)
+            mastodon_username = str(
+                credentials.get("acct") or credentials.get("username") or mastodon_account_id
             )
-            access_token = str(token_response["access_token"])
-            scopes = str(token_response.get("scope") or settings.mastodon_scopes)
-
-        async with MastodonClient(settings.mastodon_origin, token=access_token) as user_client:
-            credentials = await user_client.verify_credentials()
-
-        mastodon_account_id = str(credentials.get("id"))
-        mastodon_username = str(
-            credentials.get("acct") or credentials.get("username") or mastodon_account_id
-        )
-        await repository.upsert_moderator_link(
-            telegram_user_id=telegram_user_id,
-            mastodon_account_id=mastodon_account_id,
-            mastodon_username=mastodon_username,
-            access_token=access_token,
-            scopes=scopes,
-        )
+            stored = await repository.store_moderator_link_and_consume_state(
+                state=state,
+                telegram_user_id=telegram_user_id,
+                mastodon_account_id=mastodon_account_id,
+                mastodon_username=mastodon_username,
+                access_token=access_token,
+                scopes=scopes,
+            )
+            if not stored:
+                return web.Response(text="OAuth state changed; run /link again", status=409)
+        except (httpx.HTTPError, MastodonApiError, KeyError, ValueError):
+            await repository.release_oauth_state(state)
+            logger.warning("OAuth linking failed", extra={"telegram_user_id": telegram_user_id})
+            return web.Response(text="Mastodon linking failed; retry or run /link", status=502)
         return web.Response(
             text=f"Linked Mastodon account {mastodon_username}. You can close this page."
         )
@@ -175,7 +213,7 @@ async def _maybe_build_autoban_info(
     return AutobanInfo(
         matched_rule_type=pending.matched_rule_type,
         matched_pattern=pending.matched_pattern,
-        auto_reject_at=datetime.now(UTC) + timedelta(seconds=timeout_seconds),
+        auto_reject_at=_as_utc(pending.webhook_received_at) + timedelta(seconds=timeout_seconds),
         silent=not notify_enabled,
     )
 
@@ -397,3 +435,11 @@ def _is_message_not_modified(exc: TelegramAPIError) -> bool:
 
 def _webhook_lock_key(object_type: str, object_id: str, chat_id: int) -> str:
     return f"webhook:{object_type}:{object_id}:{chat_id}"
+
+
+def _scopes_cover(requested: str, granted: str) -> bool:
+    return set(requested.split()).issubset(granted.split())
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

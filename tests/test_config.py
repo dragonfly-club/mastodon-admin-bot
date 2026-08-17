@@ -54,3 +54,10 @@ def test_telegram_id_sets_are_parsed_from_environment(
 
     assert settings.trusted_telegram_user_ids == expected_trusted
     assert settings.telegram_home_chat_ids == expected_home
+
+
+def test_data_retention_defaults_and_validates_positive_days() -> None:
+    assert make_settings().data_retention_days == 30
+    assert make_settings(DATA_RETENTION_DAYS=90).data_retention_days == 90
+    with pytest.raises(ValueError):
+        make_settings(DATA_RETENTION_DAYS=0)

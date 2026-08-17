@@ -68,3 +68,8 @@ docker run \
 ```
 
 The image listens on `BIND_PORT`, defaulting to `8080`, and binds to `0.0.0.0` inside the container.
+
+Handled registration snapshots and stale operational records are scrubbed after
+`DATA_RETENTION_DAYS` days (default `30`). Automatic rejection uses only the linked
+Mastodon token belonging to the moderator who created the matching rule; if that
+moderator is no longer trusted or linked, the account remains pending.

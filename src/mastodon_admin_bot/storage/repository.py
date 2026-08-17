@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, delete, event, or_, select
+from sqlalchemy import CursorResult, and_, delete, event, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -18,6 +18,7 @@ from .models import (
     AppSetting,
     Base,
     BlocklistRule,
+    ModerationOperation,
     ModeratorLink,
     OAuthState,
     PendingAccount,
@@ -75,23 +76,44 @@ class Repository:
             await session.commit()
             return len(states)
 
-    async def consume_oauth_state(
+    async def claim_oauth_state(
         self,
         state: str,
+        *,
         max_age: timedelta = timedelta(minutes=15),
+        lease: timedelta = timedelta(minutes=2),
     ) -> int | None:
+        now = datetime.now(UTC)
         async with self.sessionmaker() as session:
-            result = await session.get(OAuthState, state)
-            if result is None or result.consumed_at is not None:
+            oauth_state = await session.get(OAuthState, state)
+            if oauth_state is None or oauth_state.consumed_at is not None:
                 return None
-            created_at = result.created_at
-            if created_at.tzinfo is None:
-                created_at = created_at.replace(tzinfo=UTC)
-            if datetime.now(UTC) - created_at > max_age:
+            if now - _as_utc(oauth_state.created_at) > max_age:
                 return None
-            result.consumed_at = datetime.now(UTC)
+            stale_claim = now - lease
+            result = await session.execute(
+                update(OAuthState)
+                .where(
+                    OAuthState.state == state,
+                    OAuthState.consumed_at.is_(None),
+                    or_(OAuthState.claimed_at.is_(None), OAuthState.claimed_at < stale_claim),
+                )
+                .values(claimed_at=now)
+                .execution_options(synchronize_session=False)
+            )
             await session.commit()
-            return result.telegram_user_id
+            if cast(CursorResult[Any], result).rowcount != 1:
+                return None
+            return oauth_state.telegram_user_id
+
+    async def release_oauth_state(self, state: str) -> None:
+        async with self.sessionmaker() as session:
+            await session.execute(
+                update(OAuthState)
+                .where(OAuthState.state == state, OAuthState.consumed_at.is_(None))
+                .values(claimed_at=None)
+            )
+            await session.commit()
 
     async def upsert_moderator_link(
         self,
@@ -121,6 +143,46 @@ class Repository:
                 existing.encrypted_access_token = encrypted
                 existing.scopes = scopes
             await session.commit()
+
+    async def store_moderator_link_and_consume_state(
+        self,
+        *,
+        state: str,
+        telegram_user_id: int,
+        mastodon_account_id: str,
+        mastodon_username: str,
+        access_token: str,
+        scopes: str,
+    ) -> bool:
+        encrypted = self.cipher.encrypt(access_token)
+        async with self.sessionmaker() as session:
+            oauth_state = await session.get(OAuthState, state)
+            if (
+                oauth_state is None
+                or oauth_state.telegram_user_id != telegram_user_id
+                or oauth_state.claimed_at is None
+                or oauth_state.consumed_at is not None
+            ):
+                return False
+            link = await session.get(ModeratorLink, telegram_user_id)
+            if link is None:
+                session.add(
+                    ModeratorLink(
+                        telegram_user_id=telegram_user_id,
+                        mastodon_account_id=mastodon_account_id,
+                        mastodon_username=mastodon_username,
+                        encrypted_access_token=encrypted,
+                        scopes=scopes,
+                    )
+                )
+            else:
+                link.mastodon_account_id = mastodon_account_id
+                link.mastodon_username = mastodon_username
+                link.encrypted_access_token = encrypted
+                link.scopes = scopes
+            oauth_state.consumed_at = datetime.now(UTC)
+            await session.commit()
+            return True
 
     async def get_moderator_token(self, telegram_user_id: int) -> tuple[str, str] | None:
         async with self.sessionmaker() as session:
@@ -364,6 +426,205 @@ class Repository:
             pending.handled_by = handled_by
             await session.commit()
 
+    async def claim_moderation_operation(
+        self,
+        *,
+        operation_key: str,
+        action: str,
+        object_type: str,
+        object_id: str,
+        target_id: str | None,
+        requested_by: int | None,
+        handled_by: str | None,
+    ) -> str:
+        now = datetime.now(UTC)
+        async with self.sessionmaker() as session:
+            operation = ModerationOperation(
+                operation_key=operation_key,
+                action=action,
+                object_type=object_type,
+                object_id=object_id,
+                target_id=target_id,
+                requested_by=requested_by,
+                handled_by=handled_by,
+                status="processing",
+            )
+            session.add(operation)
+            try:
+                await session.commit()
+                return "claimed"
+            except IntegrityError:
+                await session.rollback()
+            existing = await session.get(ModerationOperation, operation_key)
+            if existing is None:
+                return "busy"
+            if existing.status == "succeeded":
+                return "done"
+            if existing.status in {"processing", "uncertain"}:
+                return "busy"
+            if existing.next_attempt_at is not None and _as_utc(existing.next_attempt_at) > now:
+                return "busy"
+            result = await session.execute(
+                update(ModerationOperation)
+                .where(
+                    ModerationOperation.operation_key == operation_key,
+                    ModerationOperation.status == "failed",
+                )
+                .values(
+                    action=action,
+                    object_type=object_type,
+                    object_id=object_id,
+                    target_id=target_id,
+                    requested_by=requested_by,
+                    handled_by=handled_by,
+                    status="processing",
+                    attempts=existing.attempts + 1,
+                    last_error=None,
+                    next_attempt_at=None,
+                    completed_at=None,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            return "claimed" if cast(CursorResult[Any], result).rowcount == 1 else "busy"
+
+    async def complete_moderation_operation(
+        self,
+        operation_key: str,
+        *,
+        pending_state: str | None = None,
+        handled_by: str | None = None,
+        operation_status: str = "succeeded",
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self.sessionmaker() as session:
+            operation = await session.get(ModerationOperation, operation_key)
+            if operation is None:
+                raise RuntimeError("moderation operation disappeared")
+            operation.status = operation_status
+            operation.completed_at = now
+            operation.next_attempt_at = None
+            operation.last_error = None
+            if pending_state is not None:
+                pending = await session.scalar(
+                    select(PendingAccount).where(PendingAccount.account_id == operation.object_id)
+                )
+                if pending is not None and pending.state == "pending":
+                    pending.state = pending_state
+                    pending.handled_at = now
+                    pending.handled_by = handled_by
+            await session.commit()
+
+    async def fail_moderation_operation(
+        self,
+        operation_key: str,
+        *,
+        error: str,
+        uncertain: bool = False,
+        retry_after: timedelta | None = None,
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self.sessionmaker() as session:
+            operation = await session.get(ModerationOperation, operation_key)
+            if operation is None:
+                return
+            operation.status = "uncertain" if uncertain else "failed"
+            operation.last_error = error[:2000]
+            operation.next_attempt_at = now + retry_after if retry_after is not None else None
+            await session.commit()
+
+    async def get_moderation_operation(
+        self, operation_key: str
+    ) -> ModerationOperation | None:
+        async with self.sessionmaker() as session:
+            return await session.get(ModerationOperation, operation_key)
+
+    async def list_uncertain_moderation_operations(
+        self, *, older_than: datetime
+    ) -> list[ModerationOperation]:
+        async with self.sessionmaker() as session:
+            return list(
+                await session.scalars(
+                    select(ModerationOperation)
+                    .where(
+                        ModerationOperation.status == "uncertain",
+                        ModerationOperation.updated_at <= older_than,
+                    )
+                    .order_by(ModerationOperation.updated_at)
+                )
+            )
+
+    async def cleanup_expired_data(self, retention: timedelta) -> dict[str, int]:
+        cutoff = datetime.now(UTC) - retention
+        async with self.sessionmaker() as session:
+            handled_ids = list(
+                await session.scalars(
+                    select(PendingAccount.account_id).where(
+                        PendingAccount.handled_at.is_not(None),
+                        PendingAccount.handled_at < cutoff,
+                    )
+                )
+            )
+            active_pending_ids = select(PendingAccount.account_id).where(
+                PendingAccount.state == "pending"
+            )
+            mappings_result = await session.execute(
+                delete(TelegramMessageMapping).where(
+                    or_(
+                        and_(
+                            TelegramMessageMapping.object_type == "report",
+                            TelegramMessageMapping.updated_at < cutoff,
+                        ),
+                        and_(
+                            TelegramMessageMapping.object_type == "account",
+                            or_(
+                                TelegramMessageMapping.object_id.in_(handled_ids),
+                                and_(
+                                    TelegramMessageMapping.updated_at < cutoff,
+                                    TelegramMessageMapping.object_id.not_in(active_pending_ids),
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            )
+            pending_result = await session.execute(
+                update(PendingAccount)
+                .where(
+                    PendingAccount.handled_at.is_not(None),
+                    PendingAccount.handled_at < cutoff,
+                    or_(
+                        PendingAccount.account_snapshot != "{}",
+                        PendingAccount.matched_rule_type.is_not(None),
+                        PendingAccount.matched_pattern.is_not(None),
+                        PendingAccount.matched_rule_created_by.is_not(None),
+                    ),
+                )
+                .values(
+                    account_snapshot="{}",
+                    matched_rule_type=None,
+                    matched_pattern=None,
+                    matched_rule_created_by=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            operations_result = await session.execute(
+                delete(ModerationOperation).where(
+                    ModerationOperation.completed_at.is_not(None),
+                    ModerationOperation.completed_at < cutoff,
+                )
+            )
+            await session.commit()
+            return {
+                "mappings": cast(CursorResult[Any], mappings_result).rowcount,
+                "pending_accounts_scrubbed": cast(CursorResult[Any], pending_result).rowcount,
+                "operations": cast(CursorResult[Any], operations_result).rowcount,
+            }
+
+    async def check_database(self) -> None:
+        async with self.sessionmaker() as session:
+            await session.execute(select(1))
+
     async def get_setting(self, key: str, default: str | None = None) -> str | None:
         async with self.sessionmaker() as session:
             setting = await session.get(AppSetting, key)
@@ -392,24 +653,10 @@ class Repository:
             value = int(raw)
         except ValueError:
             return default
-        return value
+        return value if value >= 60 else default
 
     async def set_autoban_timeout_seconds(self, seconds: int) -> None:
         await self.set_setting("autoban_reject_after_seconds", str(seconds))
 
-    async def get_linked_moderator_token(
-        self,
-        preferred_telegram_user_id: int | None = None,
-    ) -> tuple[str, str] | None:
-        async with self.sessionmaker() as session:
-            if preferred_telegram_user_id is not None:
-                link = await session.get(ModeratorLink, preferred_telegram_user_id)
-                if link is not None:
-                    return self.cipher.decrypt(link.encrypted_access_token), link.mastodon_username
-            link = cast(
-                ModeratorLink | None,
-                await session.scalar(select(ModeratorLink).order_by(ModeratorLink.created_at)),
-            )
-            if link is None:
-                return None
-            return self.cipher.decrypt(link.encrypted_access_token), link.mastodon_username
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)

@@ -43,7 +43,11 @@ class KeyedAsyncLocks:
 
     async def acquire(self, key: str) -> HeldKeyLock:
         entry = await self._reserve(key)
-        await entry.lock.acquire()
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            await self._cancel_reservation(key, entry)
+            raise
         return HeldKeyLock(self, key, entry)
 
     async def try_acquire(self, key: str) -> HeldKeyLock | None:
@@ -76,3 +80,9 @@ class KeyedAsyncLocks:
                 current = self._locks.get(key)
                 if current is entry:
                     del self._locks[key]
+
+    async def _cancel_reservation(self, key: str, entry: _LockEntry) -> None:
+        async with self._guard:
+            entry.users -= 1
+            if entry.users == 0 and not entry.lock.locked() and self._locks.get(key) is entry:
+                del self._locks[key]

@@ -44,6 +44,7 @@ class OAuthState(Base):
     state: Mapped[str] = mapped_column(String(128), primary_key=True)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -91,11 +92,37 @@ class PendingAccount(Base):
     matched_rule_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
     matched_pattern: Mapped[str | None] = mapped_column(Text, nullable=True)
     matched_rule_created_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    state: Mapped[str] = mapped_column(String(16), default="pending")
+    state: Mapped[str] = mapped_column(String(32), default="pending")
     handled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     handled_by: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+
+class ModerationOperation(Base):
+    __tablename__ = "moderation_operations"
+    __table_args__ = (
+        Index("ix_moderation_operations_status_next_attempt_at", "status", "next_attempt_at"),
+    )
+
+    operation_key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    action: Mapped[str] = mapped_column(String(32))
+    object_type: Mapped[str] = mapped_column(String(64))
+    object_id: Mapped[str] = mapped_column(String(128))
+    target_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    requested_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    handled_by: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="processing")
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utc_now,
+        onupdate=utc_now,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class AppSetting(Base):
