@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 from typing import Any
 
@@ -25,9 +25,15 @@ async def auto_reject_due_accounts(
     repository: Repository,
     bot: Bot,
     mastodon_origin: str,
+    default_reject_after_seconds: int,
 ) -> int:
     now = datetime.now(UTC)
-    due = await repository.list_due_pending_auto_bans(now)
+    timeout_seconds = await repository.get_autoban_timeout_seconds(
+        default_reject_after_seconds
+    )
+    due = await repository.list_due_pending_auto_bans(
+        now - timedelta(seconds=timeout_seconds)
+    )
     processed = 0
     for pending in due:
         handled = await _auto_reject_one(

@@ -36,7 +36,6 @@ def upgrade() -> None:
         sa.Column("matched_rule_type", sa.String(length=32), nullable=True),
         sa.Column("matched_pattern", sa.Text(), nullable=True),
         sa.Column("matched_rule_created_by", sa.BigInteger(), nullable=True),
-        sa.Column("auto_reject_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("state", sa.String(length=16), nullable=False),
         sa.Column("handled_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("handled_by", sa.String(length=512), nullable=True),
@@ -44,9 +43,9 @@ def upgrade() -> None:
         sa.UniqueConstraint("account_id"),
     )
     op.create_index(
-        "ix_pending_accounts_state_auto_reject_at",
+        "ix_pending_accounts_state_webhook_received_at",
         "pending_accounts",
-        ["state", "auto_reject_at"],
+        ["state", "webhook_received_at"],
     )
     op.create_table(
         "app_settings",
@@ -60,7 +59,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("app_settings")
     op.drop_index(
-        "ix_pending_accounts_state_auto_reject_at", table_name="pending_accounts"
+        "ix_pending_accounts_state_webhook_received_at", table_name="pending_accounts"
     )
     op.drop_table("pending_accounts")
     op.drop_table("blocklist_rules")

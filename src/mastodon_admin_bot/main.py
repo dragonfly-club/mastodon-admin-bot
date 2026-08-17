@@ -79,6 +79,9 @@ def create_app() -> web.Application:
                         repository=repository,
                         bot=bot,
                         mastodon_origin=settings.mastodon_origin,
+                        default_reject_after_seconds=(
+                            settings.autoban_default_reject_after_seconds
+                        ),
                     )
                 except Exception:
                     logger.exception("Autoban sweeper iteration failed")

@@ -123,4 +123,5 @@ def render_match_line(rule_type: str, pattern: str) -> str:
 
 
 def render_auto_reject_at_line(auto_reject_at: datetime) -> str:
-    return f"Auto-reject at: {escape(auto_reject_at.strftime('%Y-%m-%d %H:%M:%S UTC'))}"
+    local_time = auto_reject_at.astimezone()
+    return f"Auto-reject at: {escape(local_time.strftime('%Y-%m-%d %H:%M:%S %:z'))}"

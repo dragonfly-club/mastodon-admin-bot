@@ -9,8 +9,16 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from mastodon_admin_bot.mastodon.client import MastodonApiError
 from mastodon_admin_bot.security import TokenCipher
+from mastodon_admin_bot.storage.models import PendingAccount
 from mastodon_admin_bot.storage.repository import Repository, create_engine
 from mastodon_admin_bot.sweeper import _auto_reject_one, auto_reject_due_accounts
+
+_DEFAULT_TIMEOUT_SECONDS = 3600
+
+
+def _default_timeout() -> dict[str, Any]:
+    return {"default_reject_after_seconds": _DEFAULT_TIMEOUT_SECONDS}
+
 
 _DEFAULT_REJECT_RESULT: dict[str, Any] = {
     "id": "1",
@@ -66,7 +74,7 @@ def _patch_mastodon_client(
     def factory(_origin: str, *, token: str | None = None) -> FakeMastodonClient:
         if capture_tokens is not None and token is not None:
             capture_tokens.append(token)
-        client = FakeMastodonClient(reject_result=reject_result, reject_error=reject_error)
+        client = FakeMastodonClient(reject_error=reject_error, reject_result=reject_result)
         if capture_clients is not None:
             capture_clients.append(client)
         return client
@@ -91,16 +99,31 @@ async def _seed_pending(
     *,
     account_id: str,
     snapshot: str = '{"email":"spam@evil.example","reason":"buy crypto"}',
-    auto_reject_at: datetime | None = None,
+    age: timedelta = timedelta(hours=2),
     matched_rule_created_by: int | None = None,
 ) -> None:
-    await repo.upsert_pending_account(
-        account_id=account_id,
-        account_snapshot=snapshot,
-        matched_rule_type="email",
-        matched_pattern="spam@",
-        matched_rule_created_by=matched_rule_created_by,
-        auto_reject_at=auto_reject_at,
+    async with repo.sessionmaker() as session:
+        session.add(
+            PendingAccount(
+                account_id=account_id,
+                account_snapshot=snapshot,
+                matched_rule_type="email",
+                matched_pattern="spam@",
+                matched_rule_created_by=matched_rule_created_by,
+                webhook_received_at=datetime.now(UTC) - age,
+                state="pending",
+            )
+        )
+        await session.commit()
+
+
+async def _seed_moderator(repo: Repository) -> None:
+    await repo.upsert_moderator_link(
+        telegram_user_id=111,
+        mastodon_account_id="m1",
+        mastodon_username="alice",
+        access_token="alice-token",
+        scopes="admin:write:accounts",
     )
 
 
@@ -109,15 +132,8 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    await repo.upsert_moderator_link(
-        telegram_user_id=111,
-        mastodon_account_id="m1",
-        mastodon_username="alice",
-        access_token="alice-token",
-        scopes="admin:write:accounts",
-    )
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(repo, account_id="1", auto_reject_at=past)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
     await repo.upsert_message_mapping(
         object_type="account", object_id="1", chat_id=10, message_id=100
     )
@@ -127,7 +143,10 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
 
     bot = FakeBot()
     processed = await auto_reject_due_accounts(
-        repository=repo, bot=cast(Any, bot), mastodon_origin="https://m.example"
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        **_default_timeout(),
     )
 
     assert processed == 1
@@ -148,12 +167,14 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
 async def test_auto_reject_skips_when_no_moderator_token() -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(repo, account_id="1", auto_reject_at=past)
+    await _seed_pending(repo, account_id="1")
 
     bot = FakeBot()
     processed = await auto_reject_due_accounts(
-        repository=repo, bot=cast(Any, bot), mastodon_origin="https://m.example"
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        **_default_timeout(),
     )
 
     assert processed == 0
@@ -168,21 +189,17 @@ async def test_auto_reject_network_error_leaves_pending_for_retry(
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    await repo.upsert_moderator_link(
-        telegram_user_id=111,
-        mastodon_account_id="m1",
-        mastodon_username="alice",
-        access_token="alice-token",
-        scopes="admin:write:accounts",
-    )
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(repo, account_id="1", auto_reject_at=past)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
 
     _patch_mastodon_client(monkeypatch, reject_error=httpx.ConnectError("down"))
 
     bot = FakeBot()
     processed = await auto_reject_due_accounts(
-        repository=repo, bot=cast(Any, bot), mastodon_origin="https://m.example"
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        **_default_timeout(),
     )
 
     assert processed == 0
@@ -197,15 +214,8 @@ async def test_auto_reject_already_handled_error_marks_auto_rejected(
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    await repo.upsert_moderator_link(
-        telegram_user_id=111,
-        mastodon_account_id="m1",
-        mastodon_username="alice",
-        access_token="alice-token",
-        scopes="admin:write:accounts",
-    )
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(repo, account_id="1", auto_reject_at=past)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
     await repo.upsert_message_mapping(
         object_type="account", object_id="1", chat_id=10, message_id=100
     )
@@ -216,7 +226,10 @@ async def test_auto_reject_already_handled_error_marks_auto_rejected(
 
     bot = FakeBot()
     processed = await auto_reject_due_accounts(
-        repository=repo, bot=cast(Any, bot), mastodon_origin="https://m.example"
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        **_default_timeout(),
     )
 
     assert processed == 1
@@ -233,22 +246,15 @@ async def test_auto_reject_permanent_client_error_marks_rejected_error(
 ) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    await repo.upsert_moderator_link(
-        telegram_user_id=111,
-        mastodon_account_id="m1",
-        mastodon_username="alice",
-        access_token="alice-token",
-        scopes="admin:write:accounts",
-    )
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(repo, account_id="1", auto_reject_at=past)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
 
-    _patch_mastodon_client(
-        monkeypatch, reject_error=MastodonApiError(401, "unauthorized")
-    )
+    _patch_mastodon_client(monkeypatch, reject_error=MastodonApiError(401, "unauthorized"))
 
     bot = FakeBot()
-    due = await repo.list_due_pending_auto_bans(datetime.now(UTC))
+    due = await repo.list_due_pending_auto_bans(
+        datetime.now(UTC) - timedelta(seconds=_DEFAULT_TIMEOUT_SECONDS)
+    )
     assert len(due) == 1
     handled = await _auto_reject_one(
         pending=due[0],
@@ -267,13 +273,7 @@ async def test_auto_reject_permanent_client_error_marks_rejected_error(
 async def test_auto_reject_prefers_rule_creator_token(monkeypatch: Any) -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
-    await repo.upsert_moderator_link(
-        telegram_user_id=111,
-        mastodon_account_id="m1",
-        mastodon_username="alice",
-        access_token="alice-token",
-        scopes="admin:write:accounts",
-    )
+    await _seed_moderator(repo)
     await repo.upsert_moderator_link(
         telegram_user_id=222,
         mastodon_account_id="m2",
@@ -281,18 +281,55 @@ async def test_auto_reject_prefers_rule_creator_token(monkeypatch: Any) -> None:
         access_token="bob-token",
         scopes="admin:write:accounts",
     )
-    past = datetime.now(UTC) - timedelta(minutes=5)
-    await _seed_pending(
-        repo, account_id="1", auto_reject_at=past, matched_rule_created_by=222
-    )
+    await _seed_pending(repo, account_id="1", matched_rule_created_by=222)
 
     tokens: list[str] = []
     _patch_mastodon_client(monkeypatch, capture_tokens=tokens)
 
     bot = FakeBot()
     await auto_reject_due_accounts(
-        repository=repo, bot=cast(Any, bot), mastodon_origin="https://m.example"
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        **_default_timeout(),
     )
 
     assert tokens == ["bob-token"]
+    await engine.dispose()
+
+
+async def test_stored_timeout_shortening_makes_old_account_due(monkeypatch: Any) -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await _seed_moderator(repo)
+    # Account arrived 2 hours ago.
+    await _seed_pending(repo, account_id="1", age=timedelta(hours=2))
+
+    _patch_mastodon_client(monkeypatch)
+    bot = FakeBot()
+
+    # With the 12h default timeout the account is not due yet.
+    processed = await auto_reject_due_accounts(
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        default_reject_after_seconds=43200,
+    )
+    assert processed == 0
+    refreshed = await repo.get_pending_account("1")
+    assert refreshed is not None
+    assert refreshed.state == "pending"
+
+    # Shortening the stored timeout to 1h makes the same old account due.
+    await repo.set_autoban_timeout_seconds(3600)
+    processed = await auto_reject_due_accounts(
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        default_reject_after_seconds=43200,
+    )
+    assert processed == 1
+    refreshed = await repo.get_pending_account("1")
+    assert refreshed is not None
+    assert refreshed.state == "auto_rejected"
     await engine.dispose()

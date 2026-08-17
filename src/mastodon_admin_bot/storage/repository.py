@@ -269,7 +269,6 @@ class Repository:
         matched_rule_type: str | None = None,
         matched_pattern: str | None = None,
         matched_rule_created_by: int | None = None,
-        auto_reject_at: datetime | None = None,
     ) -> PendingAccount:
         async with self.sessionmaker() as session:
             existing = await session.scalar(
@@ -284,7 +283,6 @@ class Repository:
                 matched_rule_type=matched_rule_type,
                 matched_pattern=matched_pattern,
                 matched_rule_created_by=matched_rule_created_by,
-                auto_reject_at=auto_reject_at,
                 state="pending",
             )
             session.add(pending)
@@ -314,15 +312,15 @@ class Repository:
                 ),
             )
 
-    async def list_due_pending_auto_bans(self, now: datetime) -> list[PendingAccount]:
+    async def list_due_pending_auto_bans(self, cutoff: datetime) -> list[PendingAccount]:
         async with self.sessionmaker() as session:
             return list(
                 await session.scalars(
                     select(PendingAccount).where(
                         PendingAccount.state == "pending",
-                        PendingAccount.auto_reject_at.is_not(None),
-                        PendingAccount.auto_reject_at <= now,
-                    ).order_by(PendingAccount.auto_reject_at)
+                        PendingAccount.matched_rule_type.is_not(None),
+                        PendingAccount.webhook_received_at <= cutoff,
+                    ).order_by(PendingAccount.webhook_received_at)
                 )
             )
 

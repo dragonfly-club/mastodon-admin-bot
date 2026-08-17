@@ -83,12 +83,8 @@ def build_router(
 
     @router.message(Command("whoami"))
     async def whoami(message: Message) -> None:
-        user_id = message.from_user.id if message.from_user else None
-        if not is_trusted_user(user_id) or user_id is None:
-            await message.answer("This bot is restricted to trusted moderators.")
-            return
-        if not _is_private_chat(message.chat.type):
-            await message.answer("Please DM this bot and run /whoami there.")
+        user_id = await _gate_management_command(message)
+        if user_id is None:
             return
         username = await repository.get_moderator_username(user_id)
         text = f"Linked Mastodon account: {username}" if username else "No Mastodon account linked."
@@ -137,6 +133,12 @@ def build_router(
         user_id = _trusted_user_id(message)
         if user_id is None:
             await message.answer("This bot is restricted to trusted moderators.")
+            return None
+        return user_id
+
+    async def _gate_private_command(message: Message) -> int | None:
+        user_id = await _gate_management_command(message)
+        if user_id is None:
             return None
         if not await _require_private(message):
             return None
@@ -197,7 +199,7 @@ def build_router(
 
     @router.message(Command("autobantimeout"))
     async def autobantimeout(message: Message, command: CommandObject) -> None:
-        if await _gate_management_command(message) is None:
+        if await _gate_private_command(message) is None:
             return
         arg = (command.args or "").strip()
         if not arg:

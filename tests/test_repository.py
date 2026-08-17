@@ -199,7 +199,6 @@ async def test_pending_account_upsert_does_not_reset_state() -> None:
         account_snapshot='{"email":"a@b"}',
         matched_rule_type="email",
         matched_pattern="a@b",
-        auto_reject_at=datetime.now(UTC) + timedelta(hours=1),
     )
     assert pending.state == "pending"
 
@@ -215,7 +214,7 @@ async def test_pending_account_upsert_does_not_reset_state() -> None:
     await engine.dispose()
 
 
-async def test_list_due_pending_auto_bans_returns_only_due_pending() -> None:
+async def test_list_due_pending_auto_bans_returns_only_due_matched() -> None:
     repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
     await repo.create_schema(engine)
     now = datetime.now(UTC)
@@ -226,32 +225,38 @@ async def test_list_due_pending_auto_bans_returns_only_due_pending() -> None:
                 PendingAccount(
                     account_id="due",
                     account_snapshot="{}",
-                    auto_reject_at=now - timedelta(minutes=1),
+                    matched_rule_type="email",
+                    matched_pattern="x",
+                    webhook_received_at=now - timedelta(hours=2),
                     state="pending",
                 ),
                 PendingAccount(
-                    account_id="future",
+                    account_id="fresh",
                     account_snapshot="{}",
-                    auto_reject_at=now + timedelta(hours=1),
+                    matched_rule_type="email",
+                    matched_pattern="x",
+                    webhook_received_at=now - timedelta(minutes=1),
                     state="pending",
                 ),
                 PendingAccount(
                     account_id="already",
                     account_snapshot="{}",
-                    auto_reject_at=now - timedelta(minutes=5),
+                    matched_rule_type="email",
+                    matched_pattern="x",
+                    webhook_received_at=now - timedelta(hours=5),
                     state="rejected",
                 ),
                 PendingAccount(
                     account_id="nomatch",
                     account_snapshot="{}",
-                    auto_reject_at=None,
+                    webhook_received_at=now - timedelta(hours=5),
                     state="pending",
                 ),
             ]
         )
         await session.commit()
 
-    due = await repo.list_due_pending_auto_bans(now)
+    due = await repo.list_due_pending_auto_bans(now - timedelta(hours=1))
     assert [p.account_id for p in due] == ["due"]
     await engine.dispose()
 

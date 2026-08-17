@@ -27,6 +27,7 @@ from mastodon_admin_bot.web.routes import (
     _deliver_event_to_chat,
     _object_type_for_event,
     _render_event_message,
+    _send_event_message,
     _should_send_new_message,
 )
 
@@ -35,6 +36,7 @@ class FakeBot:
     def __init__(self) -> None:
         self.next_message_id = 100
         self.sent: list[tuple[int, str]] = []
+        self.sent_kwargs: list[dict[str, Any]] = []
         self.edited: list[tuple[int, int, str]] = []
         self.edit_error: Exception | None = None
         self.send_started = asyncio.Event()
@@ -45,9 +47,10 @@ class FakeBot:
         *,
         chat_id: int,
         text: str,
-        **_kwargs: Any,
+        **kwargs: Any,
     ) -> SimpleNamespace:
         self.sent.append((chat_id, text))
+        self.sent_kwargs.append(kwargs)
         self.send_started.set()
         await self.allow_send.wait()
         message_id = self.next_message_id
@@ -261,7 +264,8 @@ def test_pending_account_with_match_shows_force_approve_reject_now() -> None:
     texts = [b.text for row in keyboard.inline_keyboard for b in row]
     assert texts == ["Force Approve", "Reject Now"]
     assert "Autoban: email pattern" in text
-    assert "Auto-reject at: 2026-06-24 13:30:00 UTC" in text
+    local = datetime(2026, 6, 24, 13, 30, 0, tzinfo=UTC).astimezone()
+    assert f"Auto-reject at: {local.strftime('%Y-%m-%d %H:%M:%S %:z')}" in text
 
 
 def test_pending_account_with_unmatched_autoban_info_keeps_default_keyboard() -> None:
@@ -276,6 +280,37 @@ def test_pending_account_with_unmatched_autoban_info_keeps_default_keyboard() ->
     assert keyboard is not None
     texts = [b.text for row in keyboard.inline_keyboard for b in row]
     assert texts == ["Approve", "Reject", "Open"]
+
+
+async def test_autoban_matched_account_message_is_sent_silently() -> None:
+    bot = FakeBot()
+    bot.allow_send.set()
+    await _send_event_message(
+        bot=cast(Any, bot),
+        chat_id=10,
+        event_name="account.created",
+        obj={"id": "123", "approved": False, "email": "spam@evil.example"},
+        mastodon_origin="https://mastodon.example",
+        autoban=AutobanInfo(
+            matched_rule_type="email", matched_pattern=r"^spam@.*$"
+        ),
+    )
+
+    assert bot.sent_kwargs[-1]["disable_notification"] is True
+
+
+async def test_unmatched_account_message_is_sent_with_notification() -> None:
+    bot = FakeBot()
+    bot.allow_send.set()
+    await _send_event_message(
+        bot=cast(Any, bot),
+        chat_id=10,
+        event_name="account.created",
+        obj={"id": "124", "approved": False, "email": "alice@example.test"},
+        mastodon_origin="https://mastodon.example",
+    )
+
+    assert bot.sent_kwargs[-1]["disable_notification"] is False
 
 
 async def test_concurrent_duplicate_webhook_delivery_sends_once() -> None:

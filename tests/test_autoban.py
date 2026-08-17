@@ -69,11 +69,13 @@ def test_render_match_line_escapes_pattern() -> None:
     assert "<b>bad</b>" not in line
 
 
-def test_render_auto_reject_at_line_formats_utc() -> None:
+def test_render_auto_reject_at_line_uses_local_timezone() -> None:
     from datetime import UTC, datetime
 
-    line = render_auto_reject_at_line(datetime(2026, 6, 24, 13, 30, 0, tzinfo=UTC))
-    assert "Auto-reject at: 2026-06-24 13:30:00 UTC" in line
+    source = datetime(2026, 6, 24, 13, 30, 0, tzinfo=UTC)
+    line = render_auto_reject_at_line(source)
+    local = source.astimezone()
+    assert line == f"Auto-reject at: {local.strftime('%Y-%m-%d %H:%M:%S %:z')}"
 
 
 def test_rule_type_label() -> None:

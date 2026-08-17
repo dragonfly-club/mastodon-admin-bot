@@ -152,15 +152,10 @@ async def _maybe_build_autoban_info(
         return None
     snapshot = snapshot_account(event.object)
     match = await find_match(repository, event.object)
-    timeout_seconds = await repository.get_autoban_timeout_seconds(
-        settings.autoban_default_reject_after_seconds
-    )
-    auto_reject_at: datetime | None = None
     matched_rule_type: str | None = None
     matched_pattern: str | None = None
     matched_rule_created_by: int | None = None
     if match is not None:
-        auto_reject_at = datetime.now(UTC) + timedelta(seconds=timeout_seconds)
         matched_rule_type = match.rule_type
         matched_pattern = match.pattern
         matched_rule_created_by = match.created_by
@@ -170,21 +165,17 @@ async def _maybe_build_autoban_info(
         matched_rule_type=matched_rule_type,
         matched_pattern=matched_pattern,
         matched_rule_created_by=matched_rule_created_by,
-        auto_reject_at=auto_reject_at,
+    )
+    if pending.matched_rule_type is None:
+        return AutobanInfo()
+    timeout_seconds = await repository.get_autoban_timeout_seconds(
+        settings.autoban_default_reject_after_seconds
     )
     return AutobanInfo(
         matched_rule_type=pending.matched_rule_type,
         matched_pattern=pending.matched_pattern,
-        auto_reject_at=_ensure_aware(pending.auto_reject_at),
+        auto_reject_at=datetime.now(UTC) + timedelta(seconds=timeout_seconds),
     )
-
-
-def _ensure_aware(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value
 
 
 async def _send_event_message(
@@ -203,7 +194,12 @@ async def _send_event_message(
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
         disable_web_page_preview=True,
+        disable_notification=_is_silent_autoban(autoban),
     )
+
+
+def _is_silent_autoban(autoban: AutobanInfo | None) -> bool:
+    return autoban is not None and autoban.matched_rule_type is not None
 
 
 async def _deliver_event_to_chat(
