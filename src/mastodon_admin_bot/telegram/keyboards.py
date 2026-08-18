@@ -1,8 +1,17 @@
+from collections.abc import Iterable
 from enum import StrEnum
 
+import regex
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from mastodon_admin_bot.autoban import (
+    RULE_TYPE_EMAIL,
+    RULE_TYPE_EMAIL_DOMAIN,
+    RULE_TYPE_REASON,
+)
+from mastodon_admin_bot.storage.repository import Repository
 
 
 class Action(StrEnum):
@@ -16,6 +25,49 @@ class Action(StrEnum):
     BLOCK_EMAIL = "be"
     BLOCK_EMAIL_DOMAIN = "bd"
     BLOCK_REASON = "br"
+
+
+BLOCK_ACTIONS: frozenset[Action] = frozenset(
+    {Action.BLOCK_EMAIL, Action.BLOCK_EMAIL_DOMAIN, Action.BLOCK_REASON}
+)
+BLOCK_ACTION_TO_RULE_TYPE: dict[Action, str] = {
+    Action.BLOCK_EMAIL: RULE_TYPE_EMAIL,
+    Action.BLOCK_EMAIL_DOMAIN: RULE_TYPE_EMAIL_DOMAIN,
+    Action.BLOCK_REASON: RULE_TYPE_REASON,
+}
+BLOCK_ACTION_TO_SNAPSHOT_FIELD: dict[Action, str] = {
+    Action.BLOCK_EMAIL: "email",
+    Action.BLOCK_EMAIL_DOMAIN: "email_domain",
+    Action.BLOCK_REASON: "reason",
+}
+
+
+def block_rule_pattern(value: str) -> str:
+    """Build the anchored, exact-match regex pattern used for a block rule."""
+    return "^" + regex.escape(value) + "$"
+
+
+async def applied_block_actions(
+    repository: Repository,
+    snapshot: dict[str, str],
+) -> set[Action]:
+    """Return block actions whose rule already exists for this account's values.
+
+    Each block button maps to a rule pattern derived from the account's
+    snapshot. A button stays hidden as long as its rule exists, so re-rendering
+    the keyboard after any block action removes every button that has already
+    been used, not just the one just clicked.
+    """
+    rules = await repository.list_blocklist_rules()
+    existing = {(rule.rule_type, rule.pattern) for rule in rules}
+    applied: set[Action] = set()
+    for action in BLOCK_ACTIONS:
+        value = snapshot.get(BLOCK_ACTION_TO_SNAPSHOT_FIELD[action], "")
+        if not value:
+            continue
+        if (BLOCK_ACTION_TO_RULE_TYPE[action], block_rule_pattern(value)) in existing:
+            applied.add(action)
+    return applied
 
 
 class AdminCallback(CallbackData, prefix="a"):
@@ -69,14 +121,23 @@ def autoban_keyboard(account_id: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def _excluded_actions(exclude: Action | Iterable[Action] | None) -> frozenset[Action]:
+    if exclude is None:
+        return frozenset()
+    if isinstance(exclude, Action):
+        return frozenset((exclude,))
+    return frozenset(exclude)
+
+
 def post_rejection_keyboard(
     account_id: str,
     *,
     include_reason: bool = False,
-    exclude: Action | None = None,
+    exclude: Action | Iterable[Action] | None = None,
 ) -> InlineKeyboardMarkup:
+    excluded = _excluded_actions(exclude)
     builder = InlineKeyboardBuilder()
-    if exclude != Action.BLOCK_EMAIL:
+    if Action.BLOCK_EMAIL not in excluded:
         builder.button(
             text="Block Email",
             callback_data=AdminCallback(
@@ -84,7 +145,7 @@ def post_rejection_keyboard(
                 object_id=account_id,
             ),
         )
-    if exclude != Action.BLOCK_EMAIL_DOMAIN:
+    if Action.BLOCK_EMAIL_DOMAIN not in excluded:
         builder.button(
             text="Block Domain",
             callback_data=AdminCallback(
@@ -92,7 +153,7 @@ def post_rejection_keyboard(
                 object_id=account_id,
             ),
         )
-    if include_reason and exclude != Action.BLOCK_REASON:
+    if include_reason and Action.BLOCK_REASON not in excluded:
         builder.button(
             text="Block Reason",
             callback_data=AdminCallback(

@@ -31,8 +31,13 @@ from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository
 
 from .keyboards import (
+    BLOCK_ACTION_TO_RULE_TYPE,
+    BLOCK_ACTION_TO_SNAPSHOT_FIELD,
+    BLOCK_ACTIONS,
     Action,
     AdminCallback,
+    applied_block_actions,
+    block_rule_pattern,
     open_keyboard,
     post_rejection_keyboard,
 )
@@ -49,19 +54,6 @@ _ACCOUNT_DECISION_ACTIONS: frozenset[Action] = frozenset(
         Action.REJECT_NOW_ACCOUNT,
     }
 )
-_BLOCK_ACTIONS: frozenset[Action] = frozenset(
-    {Action.BLOCK_EMAIL, Action.BLOCK_EMAIL_DOMAIN, Action.BLOCK_REASON}
-)
-_BLOCK_ACTION_TO_RULE_TYPE: dict[Action, str] = {
-    Action.BLOCK_EMAIL: RULE_TYPE_EMAIL,
-    Action.BLOCK_EMAIL_DOMAIN: RULE_TYPE_EMAIL_DOMAIN,
-    Action.BLOCK_REASON: RULE_TYPE_REASON,
-}
-_BLOCK_ACTION_TO_SNAPSHOT_FIELD: dict[Action, str] = {
-    Action.BLOCK_EMAIL: "email",
-    Action.BLOCK_EMAIL_DOMAIN: "email_domain",
-    Action.BLOCK_REASON: "reason",
-}
 
 
 def build_router(
@@ -236,7 +228,7 @@ def build_router(
             await query.answer("Not authorized.", show_alert=True)
             return
 
-        if callback_data.action in _BLOCK_ACTIONS:
+        if callback_data.action in BLOCK_ACTIONS:
             await _handle_block_callback(
                 query=query,
                 callback_data=callback_data,
@@ -317,8 +309,8 @@ def build_router(
         bot: Bot,
         action_locks: KeyedAsyncLocks,
     ) -> None:
-        rule_type = _BLOCK_ACTION_TO_RULE_TYPE[callback_data.action]
-        snapshot_field = _BLOCK_ACTION_TO_SNAPSHOT_FIELD[callback_data.action]
+        rule_type = BLOCK_ACTION_TO_RULE_TYPE[callback_data.action]
+        snapshot_field = BLOCK_ACTION_TO_SNAPSHOT_FIELD[callback_data.action]
         user_id = query.from_user.id if query.from_user else None
 
         pending = await repository.get_pending_account(callback_data.object_id)
@@ -332,7 +324,7 @@ def build_router(
                 f"{snapshot_field} not available for this account.", show_alert=True
             )
             return
-        pattern = "^" + regex.escape(value) + "$"
+        pattern = block_rule_pattern(value)
 
         async def execute() -> dict[str, Any]:
             rule, _created = await repository.add_blocklist_rule(
@@ -358,7 +350,7 @@ def build_router(
             new_markup = post_rejection_keyboard(
                 callback_data.object_id,
                 include_reason=include_reason,
-                exclude=callback_data.action,
+                exclude=await applied_block_actions(repository, snapshot),
             )
             try:
                 await bot.edit_message_reply_markup(

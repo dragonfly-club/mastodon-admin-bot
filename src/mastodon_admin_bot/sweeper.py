@@ -14,7 +14,11 @@ from mastodon_admin_bot.autoban import snapshot_from_json
 from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.storage.models import ModerationOperation, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository
-from mastodon_admin_bot.telegram.keyboards import open_keyboard, post_rejection_keyboard
+from mastodon_admin_bot.telegram.keyboards import (
+    applied_block_actions,
+    open_keyboard,
+    post_rejection_keyboard,
+)
 from mastodon_admin_bot.telegram.render import render_account_event
 
 logger = logging.getLogger(__name__)
@@ -307,10 +311,13 @@ async def _update_messages_after_reconciliation(
 ) -> None:
     if object_type == "account" and action in {"an", "rn"}:
         pending = await repository.get_pending_account(object_id)
-        include_reason = False
-        if pending is not None:
-            include_reason = bool(snapshot_from_json(pending.account_snapshot).get("reason"))
-        keyboard = post_rejection_keyboard(object_id, include_reason=include_reason)
+        snapshot = snapshot_from_json(pending.account_snapshot) if pending is not None else {}
+        include_reason = bool(snapshot.get("reason"))
+        keyboard = post_rejection_keyboard(
+            object_id,
+            include_reason=include_reason,
+            exclude=await applied_block_actions(repository, snapshot),
+        )
     else:
         page = "accounts" if object_type == "account" else "reports"
         keyboard = open_keyboard(f"{mastodon_origin.rstrip('/')}/admin/{page}/{object_id}")
@@ -360,7 +367,11 @@ async def _update_messages_after_auto_reject(
 ) -> None:
     snapshot = snapshot_from_json(pending.account_snapshot)
     include_reason = bool(snapshot.get("reason"))
-    keyboard = post_rejection_keyboard(pending.account_id, include_reason=include_reason)
+    keyboard = post_rejection_keyboard(
+        pending.account_id,
+        include_reason=include_reason,
+        exclude=await applied_block_actions(repository, snapshot),
+    )
     suffix = f"\n\nAuto-rejected by bot ({escape(username)})"
     mappings = await repository.get_message_mappings(
         object_type="account", object_id=pending.account_id

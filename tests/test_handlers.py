@@ -1,10 +1,16 @@
 from typing import Any, cast
 
+import regex
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
+from aiogram.types import InlineKeyboardMarkup
+from cryptography.fernet import Fernet
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
+from mastodon_admin_bot.storage.repository import Repository, create_engine
 from mastodon_admin_bot.telegram.handlers import (
     _account_result_event,
     _action_label,
@@ -21,7 +27,21 @@ from mastodon_admin_bot.telegram.handlers import (
     _render_blocklist,
     _snapshot_has_reason,
 )
-from mastodon_admin_bot.telegram.keyboards import Action, AdminCallback
+from mastodon_admin_bot.telegram.keyboards import (
+    Action,
+    AdminCallback,
+    applied_block_actions,
+    post_rejection_keyboard,
+)
+
+
+def make_repo(database_url: str) -> tuple[Repository, AsyncEngine]:
+    engine = create_engine(database_url)
+    repo = Repository(
+        async_sessionmaker(engine, expire_on_commit=False),
+        TokenCipher.from_key(Fernet.generate_key().decode()),
+    )
+    return repo, engine
 
 
 class FakeBot:
@@ -310,3 +330,66 @@ def test_action_result_text_force_approve_renders_approved_account() -> None:
     )
     assert "Approved: yes" in text
     assert "Handled by mod: Force approved account" in text
+
+
+def _snapshot() -> dict[str, str]:
+    return {"id": "999", "email": "a@x.com", "email_domain": "x.com", "reason": "spam"}
+
+
+def _pattern(value: str) -> str:
+    return "^" + regex.escape(value) + "$"
+
+
+async def test_applied_block_actions_tracks_existing_rules() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = _snapshot()
+
+    assert await applied_block_actions(repo, snapshot) == set()
+
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON}
+
+    await repo.add_blocklist_rule(rule_type="email", pattern=_pattern("a@x.com"), created_by=1)
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON, Action.BLOCK_EMAIL}
+
+    # A rule for a different value does not hide this account's button.
+    await repo.add_blocklist_rule(
+        rule_type="email_domain", pattern=_pattern("other.com"), created_by=1
+    )
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON, Action.BLOCK_EMAIL}
+
+    await engine.dispose()
+
+
+def _block_button_texts(markup: InlineKeyboardMarkup) -> list[str]:
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+async def test_block_buttons_stay_hidden_across_sequential_clicks() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = _snapshot()
+
+    async def keyboard() -> list[str]:
+        return _block_button_texts(
+            post_rejection_keyboard(
+                "999",
+                include_reason=True,
+                exclude=await applied_block_actions(repo, snapshot),
+            )
+        )
+
+    assert await keyboard() == ["Block Email", "Block Domain", "Block Reason"]
+
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    assert await keyboard() == ["Block Email", "Block Domain"]
+
+    await repo.add_blocklist_rule(rule_type="email", pattern=_pattern("a@x.com"), created_by=1)
+    assert await keyboard() == ["Block Domain"]
+
+    await repo.add_blocklist_rule(rule_type="email_domain", pattern=_pattern("x.com"), created_by=1)
+    assert await keyboard() == []
+
+    await engine.dispose()
+
