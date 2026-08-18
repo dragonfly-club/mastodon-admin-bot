@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import hmac
+import json
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -17,8 +20,10 @@ from mastodon_admin_bot.app_state import (
 )
 from mastodon_admin_bot.autoban import AutobanInfo
 from mastodon_admin_bot.config import Settings
+from mastodon_admin_bot.ipinfo import IpInfo
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.webhooks import (
+    MastodonWebhook,
     html_to_text,
     is_pending_local_account,
     parse_webhook_payload,
@@ -33,6 +38,7 @@ from mastodon_admin_bot.telegram.render import (
 )
 from mastodon_admin_bot.web.routes import (
     _deliver_event_to_chat,
+    _lookup_ip_geo,
     _object_type_for_event,
     _render_event_message,
     _send_event_message,
@@ -325,6 +331,7 @@ def test_pending_account_with_match_shows_force_approve_reject_now() -> None:
     assert keyboard is not None
     texts = [b.text for row in keyboard.inline_keyboard for b in row]
     assert texts == ["Force Approve", "Reject Now"]
+    assert "<b>\U0001f916 Auto-blocked registration</b>" in text
     assert "Autoban: email pattern" in text
     local = datetime(2026, 6, 24, 13, 30, 0, tzinfo=UTC).astimezone()
     assert f"Auto-reject at: {local.strftime('%Y-%m-%d %H:%M:%S %:z')}" in text
@@ -547,3 +554,214 @@ async def test_duplicate_webhook_noop_edit_is_success() -> None:
 
     assert failed is False
     await engine.dispose()
+
+
+def make_settings(**overrides: object) -> Settings:
+    values: dict[str, Any] = {
+        "TELEGRAM_BOT_TOKEN": "123:token",
+        "MASTODON_BASE_URL": "https://mastodon.example",
+        "MASTODON_WEBHOOK_SECRET": "secret",
+        "MASTODON_CLIENT_ID": "client",
+        "MASTODON_CLIENT_SECRET": "secret",
+        "MASTODON_REDIRECT_URI": "https://bot.example/oauth/callback",
+        "TOKEN_ENCRYPTION_KEY": Fernet.generate_key().decode(),
+        "TELEGRAM_HOME_CHAT_IDS": "10",
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+class FakeIpClient:
+    def __init__(self, info: IpInfo) -> None:
+        self.info = info
+        self.lookups: list[str] = []
+
+    async def lookup(self, ip: str) -> IpInfo:
+        self.lookups.append(ip)
+        return self.info
+
+
+def _pending_account_obj(ip: str = "192.0.2.1") -> dict[str, Any]:
+    return {
+        "id": "123",
+        "approved": False,
+        "domain": None,
+        "email": "alice@example.test",
+        "ip": ip,
+        "locale": "en",
+        "account": {"acct": "alice"},
+    }
+
+
+def test_account_message_titles_have_status_emojis() -> None:
+    base = _pending_account_obj()
+
+    assert render_account_event("account.created", base).startswith(
+        "<b>\u23f3 New pending registration</b>"
+    )
+    approved = {**base, "approved": True}
+    assert render_account_event("account.approved", approved).startswith(
+        "<b>\u2705 Approved account</b>"
+    )
+    assert render_account_event("account.created", approved).startswith(
+        "<b>\u2705 Approved account</b>"
+    )
+    assert render_account_event("account.rejected", base).startswith(
+        "<b>\U0001f6ab Rejected account</b>"
+    )
+    assert render_account_event(
+        "account.rejected", base, auto_rejected=True
+    ).startswith("<b>\U0001f916 Auto-rejected account</b>")
+    assert render_account_event("account.created", base, auto_banned=True).startswith(
+        "<b>\U0001f916 Auto-blocked registration</b>"
+    )
+
+
+def test_report_title_has_emoji() -> None:
+    rendered = render_report_event(
+        {
+            "id": "1",
+            "action_taken": False,
+            "account": {"account": {"acct": "reporter"}},
+            "target_account": {"account": {"acct": "target"}},
+        }
+    )
+
+    assert "<b>\U0001f6a8 New Mastodon report</b>" in rendered
+
+
+def test_account_message_shows_ip_geo_in_parentheses() -> None:
+    rendered = render_account_event(
+        "account.created",
+        _pending_account_obj(),
+        ip_geo="Berlin, Germany, <DIRAC>",
+    )
+
+    assert "IP: 192.0.2.1 (Berlin, Germany, &lt;DIRAC&gt;)\nLocale: en" in rendered
+    assert "IP: 192.0.2.1\nLocale: en" in render_account_event(
+        "account.created", _pending_account_obj()
+    )
+
+
+def test_account_message_bounds_webhook_fields() -> None:
+    rendered = render_account_event(
+        "account.created",
+        {
+            "account": {"acct": "a" * 1000, "url": "https://example.test/" + "x" * 2000},
+            "email": "e" * 1000,
+            "ip": "1" * 1000,
+            "locale": "l" * 1000,
+            "invite_request": "r" * 10000,
+        },
+        ip_geo="g" * 1000,
+    )
+
+    assert len(rendered) < 4096
+    assert rendered.count("…") == 6
+    assert "<a href=" not in rendered
+
+
+def test_report_message_bounds_webhook_fields() -> None:
+    rendered = render_report_event(
+        {
+            "id": "i" * 1000,
+            "account": {"account": {"acct": "a" * 1000}},
+            "target_account": {"account": {"acct": "t" * 1000}},
+            "category": "c" * 1000,
+            "comment": "m" * 10000,
+            "rules": [{"text": "r" * 10000}],
+            "statuses": [
+                {"account": {"acct": "s" * 1000}, "content": "p" * 10000}
+                for _ in range(4)
+            ],
+        }
+    )
+
+    assert len(rendered) < 4096
+    assert "…" in rendered
+    assert "+1 more attached statuses" in rendered
+
+
+async def test_lookup_ip_geo_only_for_pending_local_accounts() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    client = FakeIpClient(IpInfo(country="Germany", asn_org="DIRAC"))
+
+    pending_event = MastodonWebhook(
+        event="account.created",
+        created_at=None,
+        object=_pending_account_obj(),
+    )
+    assert await _lookup_ip_geo(repo, client, pending_event) == "Germany, DIRAC"
+
+    approved_event = MastodonWebhook(
+        event="account.created",
+        created_at=None,
+        object={**_pending_account_obj(), "id": "2", "approved": True},
+    )
+    remote_event = MastodonWebhook(
+        event="account.created",
+        created_at=None,
+        object={**_pending_account_obj(), "id": "3", "domain": "remote.example"},
+    )
+    report_event = MastodonWebhook(event="report.created", created_at=None, object={"id": "4"})
+    for event in (approved_event, remote_event, report_event):
+        assert await _lookup_ip_geo(repo, client, event) == ""
+
+    assert client.lookups == ["192.0.2.1"]
+    await engine.dispose()
+
+
+async def test_lookup_ip_geo_disabled_or_missing_client_returns_empty() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    client = FakeIpClient(IpInfo(country="Germany"))
+    event = MastodonWebhook(
+        event="account.created",
+        created_at=None,
+        object=_pending_account_obj(),
+    )
+
+    assert await _lookup_ip_geo(repo, None, event) == ""
+    await repo.set_ip_lookup_enabled(False)
+    assert await _lookup_ip_geo(repo, client, event) == ""
+    assert client.lookups == []
+    await engine.dispose()
+
+
+async def test_signed_webhook_delivery_shows_ip_geo_and_stores_snapshot() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    settings = make_settings()
+    ip_client = FakeIpClient(IpInfo(country="Germany", asn_org="DIRAC"))
+    bot = FakeBot()
+    bot.allow_send.set()
+    app = web.Application()
+    app.add_routes(build_routes(settings, repo, cast(Any, bot), ip_client=ip_client))
+    client = TestClient(TestServer(app))
+    try:
+        await client.start_server()
+        body = json.dumps(
+            {
+                "event": "account.created",
+                "created_at": "2026-08-26T00:00:00Z",
+                "object": _pending_account_obj(),
+            }
+        ).encode()
+        secret = settings.mastodon_webhook_secret.get_secret_value()
+        signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        response = await client.post(
+            "/mastodon/webhook", data=body, headers={"X-Hub-Signature": signature}
+        )
+
+        assert response.status == 200
+        assert ip_client.lookups == ["192.0.2.1"]
+        assert len(bot.sent) == 1
+        text = bot.sent[0][1]
+        assert "IP: 192.0.2.1 (Germany, DIRAC)" in text
+        pending = await repo.get_pending_account("123")
+        assert pending is not None
+        assert json.loads(pending.account_snapshot)["ip_geo"] == "Germany, DIRAC"
+    finally:
+        await client.close()
+        await engine.dispose()

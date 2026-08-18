@@ -55,6 +55,26 @@ moderation buttons replaced with an Open button when there is still a useful
 admin page to inspect. Rejected account registrations are marked handled without
 an Open button.
 
+## Notifications and auto-blocks
+
+Message titles carry a status emoji: ⏳ new pending registration, 🤖 auto-blocked
+registration (auto-reject scheduled), ✅ approved account, 🤖 auto-rejected account,
+🚫 rejected account, and 🚨 new Mastodon report.
+
+When a moderator rejects a registration, its invite reason is recorded as a
+*used reason* (oversized reasons are truncated). Later registrations whose invite
+reason matches a used reason (exact text, case-insensitive) are auto-rejected
+after the auto-reject timeout, like any blocklist match. While recording is on,
+the Block Reason button disappears after a rejection because the reason is
+already blocked. Recorded reasons appear in `/blocklist` and can be removed with
+`/unblockusedreason <reason>`. Toggle auto-recording with
+`/recordusedreason on|off` (default on).
+
+For pending registrations the bot looks up the registration IP's country and
+AS organization using ipip.info and shows them in parentheses after the IP
+address. Failed lookups are ignored and results are cached for 24 hours.
+Toggle the lookup with `/iplookup on|off` (default on).
+
 ## Docker
 
 ```bash

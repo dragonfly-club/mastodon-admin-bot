@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Set
 from datetime import timedelta
-from html import escape
+from html import escape, unescape
 from typing import Any
 from urllib.parse import urlencode
 
@@ -20,8 +20,12 @@ from mastodon_admin_bot.autoban import (
     RULE_TYPE_EMAIL,
     RULE_TYPE_EMAIL_DOMAIN,
     RULE_TYPE_REASON,
+    RULE_TYPE_USED_REASON,
     compile_rule_pattern,
+    record_used_reason_for_account,
     snapshot_from_json,
+    used_reason_display,
+    used_reason_pattern,
 )
 from mastodon_admin_bot.config import Settings
 from mastodon_admin_bot.locks import KeyedAsyncLocks
@@ -31,12 +35,19 @@ from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository
 
 from .keyboards import (
+    BLOCK_ACTION_TO_RULE_TYPE,
+    BLOCK_ACTION_TO_SNAPSHOT_FIELD,
+    BLOCK_ACTIONS,
     Action,
     AdminCallback,
+    BlocklistPageCallback,
+    applied_block_actions,
+    block_rule_pattern,
+    blocklist_page_keyboard,
     open_keyboard,
     post_rejection_keyboard,
 )
-from .render import render_account_event, render_report_event
+from .render import account_from_snapshot, render_account_event, render_report_event
 
 logger = logging.getLogger(__name__)
 _ACTION_LOCKS = KeyedAsyncLocks()
@@ -49,19 +60,10 @@ _ACCOUNT_DECISION_ACTIONS: frozenset[Action] = frozenset(
         Action.REJECT_NOW_ACCOUNT,
     }
 )
-_BLOCK_ACTIONS: frozenset[Action] = frozenset(
-    {Action.BLOCK_EMAIL, Action.BLOCK_EMAIL_DOMAIN, Action.BLOCK_REASON}
+
+_REJECT_DECISION_ACTIONS: frozenset[Action] = frozenset(
+    {Action.REJECT_ACCOUNT, Action.REJECT_NOW_ACCOUNT}
 )
-_BLOCK_ACTION_TO_RULE_TYPE: dict[Action, str] = {
-    Action.BLOCK_EMAIL: RULE_TYPE_EMAIL,
-    Action.BLOCK_EMAIL_DOMAIN: RULE_TYPE_EMAIL_DOMAIN,
-    Action.BLOCK_REASON: RULE_TYPE_REASON,
-}
-_BLOCK_ACTION_TO_SNAPSHOT_FIELD: dict[Action, str] = {
-    Action.BLOCK_EMAIL: "email",
-    Action.BLOCK_EMAIL_DOMAIN: "email_domain",
-    Action.BLOCK_REASON: "reason",
-}
 
 
 def build_router(
@@ -173,6 +175,12 @@ def build_router(
             return
         await _remove_blocklist_command(message, command, repository, RULE_TYPE_REASON)
 
+    @router.message(Command("unblockusedreason"))
+    async def unblockusedreason(message: Message, command: CommandObject) -> None:
+        if await _gate_management_command(message) is None:
+            return
+        await _remove_blocklist_command(message, command, repository, RULE_TYPE_USED_REASON)
+
     @router.message(Command("blocklist"))
     async def blocklist(message: Message) -> None:
         if await _gate_management_command(message) is None:
@@ -181,7 +189,12 @@ def build_router(
         if not rules:
             await message.answer("No blocklist rules.")
             return
-        await message.answer(_render_blocklist(rules), parse_mode=ParseMode.HTML)
+        pages = _render_blocklist_pages(rules)
+        await message.answer(
+            pages[0],
+            parse_mode=ParseMode.HTML,
+            reply_markup=blocklist_page_keyboard(0, len(pages)),
+        )
 
     @router.message(Command("autobantimeout"))
     async def autobantimeout(message: Message, command: CommandObject) -> None:
@@ -225,6 +238,38 @@ def build_router(
         await repository.set_notify_blocked_users_enabled(arg == "on")
         await message.answer(f"Notifications for auto-blocked accounts: {arg}.")
 
+    @router.message(Command("iplookup"))
+    async def iplookup(message: Message, command: CommandObject) -> None:
+        if await _gate_management_command(message) is None:
+            return
+        arg = (command.args or "").strip().lower()
+        if not arg:
+            current = await repository.get_ip_lookup_enabled()
+            state = "on (default)" if current else "off"
+            await message.answer(f"IP geolocation lookup: {state}.")
+            return
+        if arg not in {"on", "off"}:
+            await message.answer("Usage: /iplookup on|off")
+            return
+        await repository.set_ip_lookup_enabled(arg == "on")
+        await message.answer(f"IP geolocation lookup: {arg}.")
+
+    @router.message(Command("recordusedreason"))
+    async def recordusedreason(message: Message, command: CommandObject) -> None:
+        if await _gate_management_command(message) is None:
+            return
+        arg = (command.args or "").strip().lower()
+        if not arg:
+            current = await repository.get_record_used_reasons_enabled()
+            state = "on (default)" if current else "off"
+            await message.answer(f"Auto-record used reasons: {state}.")
+            return
+        if arg not in {"on", "off"}:
+            await message.answer("Usage: /recordusedreason on|off")
+            return
+        await repository.set_record_used_reasons_enabled(arg == "on")
+        await message.answer(f"Auto-record used reasons: {arg}.")
+
     @router.callback_query(AdminCallback.filter())
     async def admin_callback(
         query: CallbackQuery,
@@ -236,7 +281,7 @@ def build_router(
             await query.answer("Not authorized.", show_alert=True)
             return
 
-        if callback_data.action in _BLOCK_ACTIONS:
+        if callback_data.action in BLOCK_ACTIONS:
             await _handle_block_callback(
                 query=query,
                 callback_data=callback_data,
@@ -269,12 +314,13 @@ def build_router(
             return
 
         await query.answer("Done.")
+        if callback_data.action in _REJECT_DECISION_ACTIONS:
+            await _record_used_reason_for_rejection(repository, callback_data.object_id, user_id)
         if query.message and not isinstance(query.message, InaccessibleMessage):
             current_text = query.message.html_text or query.message.text or ""
             pending = await repository.get_pending_account(callback_data.object_id)
-            include_reason = _snapshot_has_reason(pending)
-            reply_markup = _post_action_markup(
-                settings.mastodon_origin, callback_data, include_reason
+            reply_markup = await _post_decision_reply_markup(
+                repository, settings.mastodon_origin, callback_data, pending
             )
             await _mark_current_message_handled(
                 bot=bot,
@@ -285,6 +331,7 @@ def build_router(
                     callback_data=callback_data,
                     api_result=api_result,
                     mastodon_username=mastodon_username,
+                    pending=pending,
                 ),
                 reply_markup=reply_markup,
             )
@@ -309,6 +356,32 @@ def build_router(
                         extra={"chat_id": mapping.chat_id, "message_id": mapping.message_id},
                     )
 
+    @router.callback_query(BlocklistPageCallback.filter())
+    async def blocklist_page(
+        query: CallbackQuery,
+        callback_data: BlocklistPageCallback,
+        bot: Bot,
+    ) -> None:
+        user_id = query.from_user.id if query.from_user else None
+        if not is_trusted_user(user_id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        rules = await repository.list_blocklist_rules()
+        pages = _render_blocklist_pages(rules)
+        if not pages:
+            await query.answer("No blocklist rules.", show_alert=True)
+            return
+        page = min(max(callback_data.page, 0), len(pages) - 1)
+        if query.message and not isinstance(query.message, InaccessibleMessage):
+            await bot.edit_message_text(
+                chat_id=query.message.chat.id,
+                message_id=query.message.message_id,
+                text=pages[page],
+                parse_mode=ParseMode.HTML,
+                reply_markup=blocklist_page_keyboard(page, len(pages)),
+            )
+        await query.answer()
+
     async def _handle_block_callback(
         *,
         query: CallbackQuery,
@@ -317,8 +390,8 @@ def build_router(
         bot: Bot,
         action_locks: KeyedAsyncLocks,
     ) -> None:
-        rule_type = _BLOCK_ACTION_TO_RULE_TYPE[callback_data.action]
-        snapshot_field = _BLOCK_ACTION_TO_SNAPSHOT_FIELD[callback_data.action]
+        rule_type = BLOCK_ACTION_TO_RULE_TYPE[callback_data.action]
+        snapshot_field = BLOCK_ACTION_TO_SNAPSHOT_FIELD[callback_data.action]
         user_id = query.from_user.id if query.from_user else None
 
         pending = await repository.get_pending_account(callback_data.object_id)
@@ -332,7 +405,7 @@ def build_router(
                 f"{snapshot_field} not available for this account.", show_alert=True
             )
             return
-        pattern = "^" + regex.escape(value) + "$"
+        pattern = block_rule_pattern(value)
 
         async def execute() -> dict[str, Any]:
             rule, _created = await repository.add_blocklist_rule(
@@ -358,7 +431,7 @@ def build_router(
             new_markup = post_rejection_keyboard(
                 callback_data.object_id,
                 include_reason=include_reason,
-                exclude=callback_data.action,
+                exclude=await applied_block_actions(repository, snapshot),
             )
             try:
                 await bot.edit_message_reply_markup(
@@ -560,16 +633,41 @@ def _action_result_text(
     callback_data: AdminCallback,
     api_result: Any,
     mastodon_username: str,
+    pending: PendingAccount | None = None,
 ) -> str:
-    if isinstance(api_result, dict) and api_result:
-        match _callback_mapping_object_type(callback_data):
-            case "account":
-                text = render_account_event(_account_result_event(callback_data.action), api_result)
-            case "report":
-                text = render_report_event(api_result)
+    if _callback_mapping_object_type(callback_data) == "account":
+        text = _account_result_text(callback_data, api_result, pending) or current_text
+    elif isinstance(api_result, dict) and api_result:
+        text = render_report_event(api_result)
     else:
         text = current_text
     return f"{text}{_handled_suffix(mastodon_username, callback_data.action)}"
+
+
+def _account_result_text(
+    callback_data: AdminCallback,
+    api_result: Any,
+    pending: PendingAccount | None,
+) -> str | None:
+    """Re-render an account message after a decision, preferring the stored snapshot.
+
+    Returns None when neither the snapshot nor the API response provides account
+    data; the caller then keeps the existing message text.
+    """
+    if pending is not None:
+        snapshot = snapshot_from_json(pending.account_snapshot)
+        approved = callback_data.action in (
+            Action.APPROVE_ACCOUNT,
+            Action.FORCE_APPROVE_ACCOUNT,
+        )
+        return render_account_event(
+            _account_result_event(callback_data.action),
+            account_from_snapshot(snapshot, approved=approved),
+            ip_geo=snapshot.get("ip_geo", ""),
+        )
+    if isinstance(api_result, dict) and api_result:
+        return render_account_event(_account_result_event(callback_data.action), api_result)
+    return None
 
 
 def _account_result_event(action: Action) -> str:
@@ -607,12 +705,31 @@ def _post_action_markup(
     mastodon_origin: str,
     callback_data: AdminCallback,
     include_reason: bool,
+    exclude: Set[Action] = frozenset(),
 ) -> InlineKeyboardMarkup | None:
-    if callback_data.action in (Action.REJECT_ACCOUNT, Action.REJECT_NOW_ACCOUNT):
+    if callback_data.action in _REJECT_DECISION_ACTIONS:
         return post_rejection_keyboard(
-            callback_data.object_id, include_reason=include_reason
+            callback_data.object_id, include_reason=include_reason, exclude=exclude
         )
     return _open_markup(mastodon_origin, callback_data)
+
+
+async def _post_decision_reply_markup(
+    repository: Repository,
+    mastodon_origin: str,
+    callback_data: AdminCallback,
+    pending: PendingAccount | None,
+) -> InlineKeyboardMarkup | None:
+    """Reply markup after a moderation decision, hiding already-applied block buttons."""
+    snapshot = snapshot_from_json(pending.account_snapshot) if pending is not None else {}
+    exclude = (
+        await applied_block_actions(repository, snapshot)
+        if callback_data.action in _REJECT_DECISION_ACTIONS
+        else frozenset()
+    )
+    return _post_action_markup(
+        mastodon_origin, callback_data, _snapshot_has_reason(pending), exclude
+    )
 
 
 def _open_url(mastodon_origin: str, callback_data: AdminCallback) -> str:
@@ -691,6 +808,7 @@ _UNBLOCK_COMMAND_FOR_RULE_TYPE: dict[str, str] = {
     RULE_TYPE_EMAIL: "unblockemail",
     RULE_TYPE_EMAIL_DOMAIN: "unblockemaildomain",
     RULE_TYPE_REASON: "unblockreason",
+    RULE_TYPE_USED_REASON: "unblockusedreason",
 }
 
 
@@ -713,18 +831,71 @@ def _format_seconds(seconds: int) -> str:
 
 
 def _render_blocklist(rules: list[BlocklistRule]) -> str:
+    return "\n".join(_blocklist_lines(rules))
+
+
+def _blocklist_lines(rules: list[BlocklistRule]) -> list[str]:
     by_type: dict[str, list[str]] = {}
     for rule in rules:
-        by_type.setdefault(rule.rule_type, []).append(rule.pattern)
+        pattern = (
+            used_reason_display(rule.pattern)
+            if rule.rule_type == RULE_TYPE_USED_REASON
+            else rule.pattern
+        )
+        by_type.setdefault(rule.rule_type, []).append(pattern)
     lines: list[str] = []
-    for rule_type in (RULE_TYPE_EMAIL, RULE_TYPE_EMAIL_DOMAIN, RULE_TYPE_REASON):
+    for rule_type in (
+        RULE_TYPE_EMAIL,
+        RULE_TYPE_EMAIL_DOMAIN,
+        RULE_TYPE_REASON,
+        RULE_TYPE_USED_REASON,
+    ):
         patterns = by_type.get(rule_type)
         if not patterns:
             continue
         lines.append(f"<b>{escape(rule_type)}</b> ({len(patterns)}):")
         for pattern in patterns:
             lines.append(f"  {hcode(pattern)}")
-    return "\n".join(lines)
+    return lines
+
+
+def _render_blocklist_pages(
+    rules: list[BlocklistRule], max_visible_length: int = 4096
+) -> list[str]:
+    """Render rules into messages within Telegram's post-parse text limit."""
+    pages: list[str] = []
+    page_lines: list[str] = []
+    visible_length = 0
+    for line in _blocklist_lines(rules):
+        # Markup consists only of the tags emitted here; unescaping gives the
+        # length Telegram applies after parsing HTML entities.
+        visible_line = regex.sub(r"</?(?:b|code)>", "", line)
+        visible_line = unescape(visible_line)
+        added_length = len(visible_line) + (1 if page_lines else 0)
+        if page_lines and visible_length + added_length > max_visible_length:
+            pages.append("\n".join(page_lines))
+            page_lines = []
+            visible_length = 0
+            added_length = len(visible_line)
+        page_lines.append(line)
+        visible_length += added_length
+    if page_lines:
+        pages.append("\n".join(page_lines))
+    return pages
+
+
+async def _record_used_reason_for_rejection(
+    repository: Repository,
+    account_id: str,
+    created_by: int | None,
+) -> None:
+    """Record the rejected registration's invite reason for future auto-rejection."""
+    if not await repository.get_record_used_reasons_enabled():
+        return
+    try:
+        await record_used_reason_for_account(repository, account_id, created_by)
+    except Exception:
+        logger.exception("Failed to record used reason", extra={"account_id": account_id})
 
 
 async def _add_blocklist_command(
@@ -766,7 +937,10 @@ async def _remove_blocklist_command(
     if not arg:
         await message.answer(f"Usage: /{command_name} &lt;regex&gt;")
         return
-    removed = await repository.remove_blocklist_rule(rule_type=rule_type, pattern=arg)
+    stored_pattern = used_reason_pattern(arg) if rule_type == RULE_TYPE_USED_REASON else arg
+    removed = await repository.remove_blocklist_rule(
+        rule_type=rule_type, pattern=stored_pattern
+    )
     if removed:
         await message.answer(f"Removed {removed} {escape(rule_type)} rule(s).")
     else:

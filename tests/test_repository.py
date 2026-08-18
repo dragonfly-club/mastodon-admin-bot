@@ -179,6 +179,10 @@ async def test_blocklist_rule_round_trip() -> None:
     assert [r.pattern for r in rules] == [r"^spam@.*$"]
 
     domain, _ = await repo.add_blocklist_rule(rule_type="email_domain", pattern="evil")
+    assert [r.pattern for r in await repo.list_blocklist_rules()] == [
+        "evil",
+        r"^spam@.*$",
+    ]
     listed = await repo.list_blocklist_rules(rule_type="email_domain")
     assert [r.pattern for r in listed] == ["evil"]
     assert [r.pattern for r in await repo.list_blocklist_rules(rule_type="email")] == [
@@ -447,6 +451,47 @@ async def test_durable_operation_claim_is_atomic_across_sessions(tmp_path: Path)
     results = await asyncio.gather(claim(), claim())
 
     assert sorted(results) == ["busy", "claimed"]
+    await engine.dispose()
+
+
+async def test_stale_processing_operation_is_reconcilable() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.claim_moderation_operation(
+        operation_key="account_decision:1",
+        action="ao",
+        object_type="account",
+        object_id="1",
+        target_id=None,
+        requested_by=123,
+        handled_by="admin",
+    )
+    now = datetime.now(UTC)
+    async with repo.sessionmaker() as session:
+        operation = await session.get(ModerationOperation, "account_decision:1")
+        assert operation is not None
+        operation.updated_at = now - timedelta(minutes=2)
+        await session.commit()
+
+    operations = await repo.list_reconcilable_moderation_operations(
+        uncertain_older_than=now - timedelta(seconds=5),
+        processing_older_than=now - timedelta(minutes=1),
+    )
+
+    assert [operation.operation_key for operation in operations] == ["account_decision:1"]
+
+    async with repo.sessionmaker() as session:
+        operation = await session.get(ModerationOperation, "account_decision:1")
+        assert operation is not None
+        operation.updated_at = now
+        await session.commit()
+    assert (
+        await repo.list_reconcilable_moderation_operations(
+            uncertain_older_than=now - timedelta(seconds=5),
+            processing_older_than=now - timedelta(minutes=1),
+        )
+        == []
+    )
     await engine.dispose()
 
 

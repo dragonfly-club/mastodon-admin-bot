@@ -1,19 +1,27 @@
 from typing import Any
 
+import regex
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from mastodon_admin_bot.autoban import (
+    MAX_PATTERN_LENGTH,
     RULE_TYPE_EMAIL,
     RULE_TYPE_EMAIL_DOMAIN,
     RULE_TYPE_REASON,
+    RULE_TYPE_USED_REASON,
     find_match,
+    fit_reason_to_pattern_limit,
+    record_used_reason,
+    record_used_reason_for_account,
     render_auto_reject_at_line,
     render_match_line,
     rule_type_label,
     snapshot_account,
     snapshot_from_json,
     snapshot_to_json,
+    used_reason_display,
+    used_reason_pattern,
 )
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.repository import Repository, create_engine
@@ -173,4 +181,137 @@ async def test_find_match_times_out_pathological_regex() -> None:
     match = await find_match(repo, {"invite_request": "a" * 2000 + "!"})
 
     assert match is None
+    await engine.dispose()
+
+
+def test_used_reason_pattern_is_anchored_and_case_insensitive() -> None:
+    pattern = used_reason_pattern("Buy Crypto")
+
+    assert regex.search(pattern, "buy crypto") is not None
+    assert regex.search(pattern, "BUY CRYPTO") is not None
+    assert regex.search(pattern, "i want to buy crypto") is None
+    assert regex.search(pattern, "buy crypto now") is None
+
+
+def test_used_reason_display_reverses_escaping() -> None:
+    for reason in ("Buy Crypto (urgent)", "buy crypto", "a$b c@d"):
+        assert used_reason_display(used_reason_pattern(reason)) == reason
+    assert used_reason_display("^custom$") == "^custom$"
+
+
+def test_render_match_line_decodes_used_reason_pattern() -> None:
+    line = render_match_line(RULE_TYPE_USED_REASON, used_reason_pattern("buy crypto"))
+
+    assert "Autoban: used reason pattern" in line
+    assert "buy crypto" in line
+    assert "(?i)^" not in line
+
+
+def test_snapshot_account_stores_ip_geo_when_present() -> None:
+    snapshot = snapshot_account({"email": "a@b"}, ip_geo="Berlin · AS3320 DIRAC")
+
+    assert snapshot["ip_geo"] == "Berlin · AS3320 DIRAC"
+    assert "ip_geo" not in snapshot_account({"email": "a@b"})
+
+
+async def test_find_match_used_reason() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON, pattern=used_reason_pattern("buy crypto")
+    )
+    match = await find_match(
+        repo, {"invite_request": "BUY CRYPTO", "account": {"acct": "x"}}
+    )
+
+    assert match is not None
+    assert match.rule_type == RULE_TYPE_USED_REASON
+    await engine.dispose()
+
+
+async def test_find_match_used_reason_ignores_outer_whitespace() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON, pattern=used_reason_pattern("buy crypto")
+    )
+
+    match = await find_match(repo, {"invite_request": "  buy crypto\n"})
+
+    assert match is not None
+    assert match.rule_type == RULE_TYPE_USED_REASON
+    await engine.dispose()
+
+
+async def test_find_match_manual_reason_takes_precedence_over_used_reason() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON, pattern=used_reason_pattern("buy crypto")
+    )
+    await repo.add_blocklist_rule(rule_type=RULE_TYPE_REASON, pattern="crypto")
+    match = await find_match(
+        repo, {"invite_request": "buy crypto", "account": {"acct": "x"}}
+    )
+
+    assert match is not None
+    assert match.rule_type == RULE_TYPE_REASON
+    await engine.dispose()
+
+
+async def test_record_used_reason_creates_rule_once() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await record_used_reason(repo, "buy crypto", created_by=7) is True
+    assert await record_used_reason(repo, "buy crypto", created_by=7) is False
+    assert await record_used_reason(repo, "   ", created_by=7) is False
+
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert len(rules) == 1
+    assert rules[0].created_by == 7
+    assert rules[0].pattern == used_reason_pattern("buy crypto")
+    await engine.dispose()
+
+
+async def test_record_used_reason_for_account_reads_snapshot() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(
+        account_id="9", account_snapshot='{"reason": "buy crypto"}'
+    )
+    await repo.upsert_pending_account(
+        account_id="10", account_snapshot='{"reason": ""}'
+    )
+
+    assert await record_used_reason_for_account(repo, "9", created_by=5) is True
+    assert await record_used_reason_for_account(repo, "10") is False
+    assert await record_used_reason_for_account(repo, "missing") is False
+    await engine.dispose()
+
+
+def test_fit_reason_to_pattern_limit_shortens_long_reasons() -> None:
+    assert fit_reason_to_pattern_limit("short reason") == "short reason"
+
+    fitted = fit_reason_to_pattern_limit("y " * 800)
+    assert len(used_reason_pattern(fitted)) <= MAX_PATTERN_LENGTH
+    assert fitted.startswith("y ")
+
+
+async def test_record_used_reason_truncates_oversized_reasons() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    assert await record_used_reason(repo, "x" * 2000, created_by=7) is True
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert len(rules) == 1
+    assert len(rules[0].pattern) <= MAX_PATTERN_LENGTH
+    truncated = used_reason_display(rules[0].pattern)
+    assert truncated == "x" * (len(rules[0].pattern) - 6)
+
+    match = await find_match(
+        repo, {"invite_request": truncated, "account": {"acct": "x"}}
+    )
+    assert match is not None
+    assert match.rule_type == RULE_TYPE_USED_REASON
     await engine.dispose()

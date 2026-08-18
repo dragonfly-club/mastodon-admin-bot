@@ -21,17 +21,20 @@ MAX_PATTERN_LENGTH = 1024
 RULE_TYPE_EMAIL = "email"
 RULE_TYPE_EMAIL_DOMAIN = "email_domain"
 RULE_TYPE_REASON = "reason"
+RULE_TYPE_USED_REASON = "used_reason"
 
 _RULE_TYPE_LABELS: dict[str, str] = {
     RULE_TYPE_EMAIL: "email",
     RULE_TYPE_EMAIL_DOMAIN: "email domain",
     RULE_TYPE_REASON: "reason",
+    RULE_TYPE_USED_REASON: "used reason",
 }
 
 _MATCH_ORDER: tuple[str, ...] = (
     RULE_TYPE_EMAIL,
     RULE_TYPE_EMAIL_DOMAIN,
     RULE_TYPE_REASON,
+    RULE_TYPE_USED_REASON,
 )
 
 
@@ -48,7 +51,7 @@ def rule_type_label(rule_type: str) -> str:
     return _RULE_TYPE_LABELS.get(rule_type, rule_type)
 
 
-def snapshot_account(account: dict[str, Any]) -> dict[str, str]:
+def snapshot_account(account: dict[str, Any], ip_geo: str = "") -> dict[str, str]:
     email = str(account.get("email") or "")
     email_domain = ""
     if "@" in email:
@@ -61,7 +64,7 @@ def snapshot_account(account: dict[str, Any]) -> dict[str, str]:
         acct = str(account.get("username") or "")
     ip = str(account.get("ip") or "")
     locale = str(account.get("locale") or "")
-    return {
+    snapshot = {
         "email": email,
         "email_domain": email_domain,
         "reason": reason,
@@ -69,6 +72,9 @@ def snapshot_account(account: dict[str, Any]) -> dict[str, str]:
         "ip": ip,
         "locale": locale,
     }
+    if ip_geo:
+        snapshot["ip_geo"] = ip_geo
+    return snapshot
 
 
 def snapshot_to_json(snapshot: dict[str, str]) -> str:
@@ -89,6 +95,8 @@ def _account_field_for_rule(rule_type: str, snapshot: dict[str, str]) -> str:
         return snapshot.get("email_domain", "")
     if rule_type == RULE_TYPE_REASON:
         return snapshot.get("reason", "")
+    if rule_type == RULE_TYPE_USED_REASON:
+        return snapshot.get("reason", "").strip()
     return ""
 
 
@@ -132,8 +140,74 @@ def compile_rule_pattern(pattern: str) -> regex.Pattern[str]:
     return regex.compile(pattern)
 
 
+def used_reason_pattern(reason: str) -> str:
+    """Anchored, case-insensitive exact-match pattern for a used invite reason."""
+    return "(?i)^" + regex.escape(reason.strip()) + "$"
+
+
+def used_reason_display(pattern: str) -> str:
+    """Reverse the :func:`used_reason_pattern` encoding for display purposes."""
+    prefix = "(?i)^"
+    if pattern.startswith(prefix) and pattern.endswith("$") and len(pattern) > len(prefix) + 1:
+        return regex.sub(r"\\(.)", r"\1", pattern[len(prefix) : -1])
+    return pattern
+
+
+def fit_reason_to_pattern_limit(reason: str) -> str:
+    """Shorten ``reason`` (prefix-wise) until its pattern fits the length limit."""
+    if len(used_reason_pattern(reason)) <= MAX_PATTERN_LENGTH:
+        return reason
+    lo, hi = 0, len(reason)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(used_reason_pattern(reason[:mid])) <= MAX_PATTERN_LENGTH:
+            lo = mid
+        else:
+            hi = mid - 1
+    return reason[:lo].rstrip()
+
+
+async def record_used_reason(
+    repository: Repository,
+    reason: str,
+    created_by: int | None = None,
+) -> bool:
+    """Record a rejected registration's invite reason for future auto-rejection.
+
+    Reasons longer than the pattern limit are truncated to a prefix. Returns
+    True when a new rule was created, False when the reason was empty or a
+    rule for it already exists.
+    """
+    reason = fit_reason_to_pattern_limit(reason.strip())
+    if not reason:
+        return False
+    _, created = await repository.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON,
+        pattern=used_reason_pattern(reason),
+        created_by=created_by,
+    )
+    return created
+
+
+async def record_used_reason_for_account(
+    repository: Repository,
+    account_id: str,
+    created_by: int | None = None,
+) -> bool:
+    """Record the stored invite reason of a rejected pending account, if any."""
+    pending = await repository.get_pending_account(account_id)
+    if pending is None:
+        return False
+    reason = snapshot_from_json(pending.account_snapshot).get("reason", "").strip()
+    if not reason:
+        return False
+    return await record_used_reason(repository, reason, created_by)
+
+
 def render_match_line(rule_type: str, pattern: str) -> str:
     label = escape(rule_type_label(rule_type))
+    if rule_type == RULE_TYPE_USED_REASON:
+        pattern = used_reason_display(pattern)
     rendered_pattern = hcode(pattern)
     return f"Autoban: {label} pattern {rendered_pattern} matched"
 

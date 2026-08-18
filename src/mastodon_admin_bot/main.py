@@ -25,6 +25,7 @@ from mastodon_admin_bot.app_state import (
     REPOSITORY_KEY,
 )
 from mastodon_admin_bot.config import get_settings
+from mastodon_admin_bot.ipinfo import IpInfoClient
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.migrations import upgrade_database
 from mastodon_admin_bot.storage.repository import Repository, create_engine
@@ -85,6 +86,10 @@ def create_app() -> web.Application:
         TokenCipher.from_key(settings.token_encryption_key.get_secret_value()),
     )
     bot = build_bot()
+    ip_client = IpInfoClient(
+        ipv4_prefix_length=settings.ip_lookup_ipv4_prefix_length,
+        ipv6_prefix_length=settings.ip_lookup_ipv6_prefix_length,
+    )
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(settings, repository))
 
@@ -170,6 +175,7 @@ def create_app() -> web.Application:
 
     async def dispose(_app: web.Application) -> None:
         await engine.dispose()
+        await ip_client.aclose()
 
     app.on_startup.append(init_db)
     app.on_startup.append(start_polling)
@@ -179,7 +185,7 @@ def create_app() -> web.Application:
     app.on_cleanup.append(stop_autoban_sweeper)
     app.on_cleanup.append(stop_maintenance)
     app.on_cleanup.append(dispose)
-    app.add_routes(build_routes(settings, repository, bot))
+    app.add_routes(build_routes(settings, repository, bot, ip_client=ip_client))
     return app
 
 
@@ -203,6 +209,10 @@ async def _register_bot_commands(bot: Bot) -> None:
             command="unblockemaildomain", description="Remove an email-domain regex"
         ),
         BotCommand(command="unblockreason", description="Remove an invite-reason regex"),
+        BotCommand(
+            command="unblockusedreason",
+            description="Remove a recorded used reason (exact text)",
+        ),
         BotCommand(command="blocklist", description="List all blocklist rules"),
         BotCommand(
             command="autobantimeout",
@@ -211,6 +221,13 @@ async def _register_bot_commands(bot: Bot) -> None:
         BotCommand(
             command="notifyblockeduser",
             description="Show or set notifications for auto-blocked accounts (on|off)",
+        ),
+        BotCommand(
+            command="iplookup", description="Show or set registration IP lookup (on|off)"
+        ),
+        BotCommand(
+            command="recordusedreason",
+            description="Show or set auto-recording of used reasons (on|off)",
         ),
     ]
     try:

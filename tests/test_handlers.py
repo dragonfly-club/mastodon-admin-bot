@@ -1,10 +1,17 @@
 from typing import Any, cast
 
+import regex
 from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import EditMessageText
+from aiogram.types import InlineKeyboardMarkup
+from cryptography.fernet import Fernet
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from mastodon_admin_bot.autoban import RULE_TYPE_USED_REASON, used_reason_pattern
+from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.models import BlocklistRule, PendingAccount
+from mastodon_admin_bot.storage.repository import Repository, create_engine
 from mastodon_admin_bot.telegram.handlers import (
     _account_result_event,
     _action_label,
@@ -18,10 +25,29 @@ from mastodon_admin_bot.telegram.handlers import (
     _open_url,
     _pending_state_for_action,
     _post_action_markup,
+    _post_decision_reply_markup,
+    _record_used_reason_for_rejection,
+    _remove_blocklist_command,
     _render_blocklist,
+    _render_blocklist_pages,
     _snapshot_has_reason,
 )
-from mastodon_admin_bot.telegram.keyboards import Action, AdminCallback
+from mastodon_admin_bot.telegram.keyboards import (
+    Action,
+    AdminCallback,
+    applied_block_actions,
+    blocklist_page_keyboard,
+    post_rejection_keyboard,
+)
+
+
+def make_repo(database_url: str) -> tuple[Repository, AsyncEngine]:
+    engine = create_engine(database_url)
+    repo = Repository(
+        async_sessionmaker(engine, expire_on_commit=False),
+        TokenCipher.from_key(Fernet.generate_key().decode()),
+    )
+    return repo, engine
 
 
 class FakeBot:
@@ -248,6 +274,26 @@ def test_post_action_markup_force_approve_keeps_open_button() -> None:
     assert markup.inline_keyboard[0][0].text == "Open"
 
 
+async def test_post_action_markup_reject_hides_applied_block_buttons() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = {"email": "a@x.com", "email_domain": "x.com", "reason": "spam"}
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    await repo.add_blocklist_rule(rule_type="email", pattern=_pattern("a@x.com"), created_by=1)
+
+    callback = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="999")
+    markup = _post_action_markup(
+        "https://mastodon.example",
+        callback,
+        include_reason=True,
+        exclude=await applied_block_actions(repo, snapshot),
+    )
+
+    assert markup is not None
+    assert _block_button_texts(markup) == ["Block Domain"]
+    await engine.dispose()
+
+
 def test_snapshot_has_reason_reads_pending_account_snapshot() -> None:
     with_reason = PendingAccount(account_id="1", account_snapshot='{"reason":"hi"}')
     without_reason = PendingAccount(account_id="2", account_snapshot='{"reason":""}')
@@ -310,3 +356,203 @@ def test_action_result_text_force_approve_renders_approved_account() -> None:
     )
     assert "Approved: yes" in text
     assert "Handled by mod: Force approved account" in text
+
+
+def _snapshot() -> dict[str, str]:
+    return {"id": "999", "email": "a@x.com", "email_domain": "x.com", "reason": "spam"}
+
+
+def _pattern(value: str) -> str:
+    return "^" + regex.escape(value) + "$"
+
+
+async def test_applied_block_actions_hides_reason_when_used_reason_recorded() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = _snapshot()
+
+    assert await applied_block_actions(repo, snapshot) == set()
+    await repo.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON, pattern=used_reason_pattern("spam"), created_by=1
+    )
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON}
+    await engine.dispose()
+
+
+async def test_applied_block_actions_tracks_existing_rules() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = _snapshot()
+
+    assert await applied_block_actions(repo, snapshot) == set()
+
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON}
+
+    await repo.add_blocklist_rule(rule_type="email", pattern=_pattern("a@x.com"), created_by=1)
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON, Action.BLOCK_EMAIL}
+
+    # A rule for a different value does not hide this account's button.
+    await repo.add_blocklist_rule(
+        rule_type="email_domain", pattern=_pattern("other.com"), created_by=1
+    )
+    assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON, Action.BLOCK_EMAIL}
+
+    await engine.dispose()
+
+
+def _block_button_texts(markup: InlineKeyboardMarkup) -> list[str]:
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+async def test_block_buttons_stay_hidden_across_sequential_clicks() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = _snapshot()
+
+    async def keyboard() -> list[str]:
+        return _block_button_texts(
+            post_rejection_keyboard(
+                "999",
+                include_reason=True,
+                exclude=await applied_block_actions(repo, snapshot),
+            )
+        )
+
+    assert await keyboard() == ["Block Email", "Block Domain", "Block Reason"]
+
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    assert await keyboard() == ["Block Email", "Block Domain"]
+
+    await repo.add_blocklist_rule(rule_type="email", pattern=_pattern("a@x.com"), created_by=1)
+    assert await keyboard() == ["Block Domain"]
+
+    await repo.add_blocklist_rule(rule_type="email_domain", pattern=_pattern("x.com"), created_by=1)
+    assert await keyboard() == []
+
+    await engine.dispose()
+
+
+
+async def test_record_used_reason_for_rejection_records_snapshot_reason() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(
+        account_id="77",
+        account_snapshot='{"reason": "buy crypto", "email": "a@b"}',
+    )
+
+    await _record_used_reason_for_rejection(repo, "77", 111)
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert len(rules) == 1
+    assert rules[0].created_by == 111
+
+    # Missing pending row and empty reasons are ignored.
+    await _record_used_reason_for_rejection(repo, "missing", 111)
+    await repo.upsert_pending_account(account_id="78", account_snapshot='{"reason": ""}')
+    await _record_used_reason_for_rejection(repo, "78", 111)
+    assert len(await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)) == 1
+    await engine.dispose()
+
+
+def test_render_blocklist_includes_used_reasons() -> None:
+    rules = [
+        BlocklistRule(rule_type="used_reason", pattern="(?i)^buy crypto$"),
+        BlocklistRule(rule_type="reason", pattern="spam"),
+    ]
+
+    rendered = _render_blocklist(rules)
+    assert "<b>used_reason</b> (1):" in rendered
+    assert "buy crypto" in rendered
+    assert "(?i)^" not in rendered
+    assert "<b>reason</b> (1):" in rendered
+
+
+def test_render_blocklist_pages_stay_within_telegram_limit() -> None:
+    rules = [
+        BlocklistRule(rule_type="used_reason", pattern=used_reason_pattern(f"reason {i} " * 20))
+        for i in range(100)
+    ]
+
+    pages = _render_blocklist_pages(rules)
+
+    assert len(pages) > 1
+    assert all(len(regex.sub(r"</?(?:b|code)>", "", page)) <= 4096 for page in pages)
+    assert sum(page.count("<code>") for page in pages) == 100
+
+
+def test_blocklist_page_keyboard_has_expected_navigation() -> None:
+    first = blocklist_page_keyboard(0, 3)
+    middle = blocklist_page_keyboard(1, 3)
+    last = blocklist_page_keyboard(2, 3)
+
+    assert first is not None
+    assert [button.text for button in first.inline_keyboard[0]] == ["Next"]
+    assert middle is not None
+    assert [button.text for button in middle.inline_keyboard[0]] == ["Prev", "Next"]
+    assert last is not None
+    assert [button.text for button in last.inline_keyboard[0]] == ["Prev"]
+    assert blocklist_page_keyboard(0, 1) is None
+
+
+async def test_unblock_used_reason_accepts_displayed_exact_text() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.add_blocklist_rule(
+        rule_type=RULE_TYPE_USED_REASON,
+        pattern=used_reason_pattern("Buy Crypto (urgent)"),
+    )
+
+    class FakeMessage:
+        async def answer(self, _text: str) -> None:
+            return None
+
+    class FakeCommand:
+        args = "Buy Crypto (urgent)"
+
+    await _remove_blocklist_command(
+        cast(Any, FakeMessage()), cast(Any, FakeCommand()), repo, RULE_TYPE_USED_REASON
+    )
+
+    assert await repo.list_blocklist_rules(RULE_TYPE_USED_REASON) == []
+    await engine.dispose()
+
+
+async def test_post_decision_reply_markup_hides_applied_block_buttons() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(
+        account_id="999",
+        account_snapshot='{"email": "a@x.com", "email_domain": "x.com", "reason": "spam"}',
+    )
+    await repo.add_blocklist_rule(rule_type="reason", pattern=_pattern("spam"), created_by=1)
+    pending = await repo.get_pending_account("999")
+
+    reject_now = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="999")
+    markup = await _post_decision_reply_markup(
+        repo, "https://mastodon.example", reject_now, pending
+    )
+    assert markup is not None
+    assert _block_button_texts(markup) == ["Block Email", "Block Domain"]
+
+    # Non-reject decisions keep the Open button and ignore applied rules.
+    approve = AdminCallback(action=Action.APPROVE_ACCOUNT, object_id="999")
+    approve_markup = await _post_decision_reply_markup(
+        repo, "https://mastodon.example", approve, pending
+    )
+    assert approve_markup is not None
+    assert approve_markup.inline_keyboard[0][0].text == "Open"
+    await engine.dispose()
+
+
+async def test_post_decision_reply_markup_handles_missing_pending() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+
+    reject = AdminCallback(action=Action.REJECT_ACCOUNT, object_id="missing")
+    markup = await _post_decision_reply_markup(
+        repo, "https://mastodon.example", reject, None
+    )
+    assert markup is not None
+    assert _block_button_texts(markup) == ["Block Email", "Block Domain"]
+    await engine.dispose()

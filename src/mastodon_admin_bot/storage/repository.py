@@ -338,7 +338,7 @@ class Repository:
     async def list_blocklist_rules(self, rule_type: str | None = None) -> list[BlocklistRule]:
         async with self.sessionmaker() as session:
             stmt = select(BlocklistRule).order_by(
-                BlocklistRule.rule_type, BlocklistRule.created_at
+                BlocklistRule.created_at.desc(), BlocklistRule.id.desc()
             )
             if rule_type is not None:
                 stmt = stmt.where(BlocklistRule.rule_type == rule_type)
@@ -539,16 +539,24 @@ class Repository:
         async with self.sessionmaker() as session:
             return await session.get(ModerationOperation, operation_key)
 
-    async def list_uncertain_moderation_operations(
-        self, *, older_than: datetime
+    async def list_reconcilable_moderation_operations(
+        self, *, uncertain_older_than: datetime, processing_older_than: datetime
     ) -> list[ModerationOperation]:
         async with self.sessionmaker() as session:
             return list(
                 await session.scalars(
                     select(ModerationOperation)
                     .where(
-                        ModerationOperation.status == "uncertain",
-                        ModerationOperation.updated_at <= older_than,
+                        or_(
+                            and_(
+                                ModerationOperation.status == "uncertain",
+                                ModerationOperation.updated_at <= uncertain_older_than,
+                            ),
+                            and_(
+                                ModerationOperation.status == "processing",
+                                ModerationOperation.updated_at <= processing_older_than,
+                            ),
+                        ),
                     )
                     .order_by(ModerationOperation.updated_at)
                 )
@@ -644,6 +652,18 @@ class Repository:
 
     async def set_notify_blocked_users_enabled(self, enabled: bool) -> None:
         await self.set_setting("notify_blocked_users", "on" if enabled else "off")
+
+    async def get_ip_lookup_enabled(self) -> bool:
+        return (await self.get_setting("ip_lookup_enabled")) != "off"
+
+    async def set_ip_lookup_enabled(self, enabled: bool) -> None:
+        await self.set_setting("ip_lookup_enabled", "on" if enabled else "off")
+
+    async def get_record_used_reasons_enabled(self) -> bool:
+        return (await self.get_setting("record_used_reasons")) != "off"
+
+    async def set_record_used_reasons_enabled(self, enabled: bool) -> None:
+        await self.set_setting("record_used_reasons", "on" if enabled else "off")
 
     async def get_autoban_timeout_seconds(self, default: int) -> int:
         raw = await self.get_setting("autoban_reject_after_seconds")

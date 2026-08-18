@@ -26,9 +26,14 @@ from mastodon_admin_bot.autoban import (
     snapshot_to_json,
 )
 from mastodon_admin_bot.config import Settings
+from mastodon_admin_bot.ipinfo import IpInfoLookup
 from mastodon_admin_bot.locks import KeyedAsyncLocks
 from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
-from mastodon_admin_bot.mastodon.webhooks import is_pending_local_account, parse_webhook_payload
+from mastodon_admin_bot.mastodon.webhooks import (
+    MastodonWebhook,
+    is_pending_local_account,
+    parse_webhook_payload,
+)
 from mastodon_admin_bot.security import verify_mastodon_signature
 from mastodon_admin_bot.storage.repository import Repository
 from mastodon_admin_bot.telegram.keyboards import (
@@ -50,6 +55,7 @@ def build_routes(
     settings: Settings,
     repository: Repository,
     bot: Bot,
+    ip_client: IpInfoLookup | None = None,
     webhook_locks: KeyedAsyncLocks = _WEBHOOK_LOCKS,
 ) -> web.RouteTableDef:
     routes = web.RouteTableDef()
@@ -98,7 +104,10 @@ def build_routes(
         if object_type is None or object_id is None:
             return web.json_response({"ok": True, "ignored": True})
 
-        autoban = await _maybe_build_autoban_info(repository, event, object_id, settings)
+        ip_geo = await _lookup_ip_geo(repository, ip_client, event)
+        autoban = await _maybe_build_autoban_info(
+            repository, event, object_id, settings, ip_geo=ip_geo
+        )
 
         failed_chat_ids: list[int] = []
         if settings.telegram_home_chat_ids:
@@ -114,6 +123,7 @@ def build_routes(
                     obj=event.object,
                     mastodon_origin=settings.mastodon_origin,
                     autoban=autoban,
+                    ip_geo=ip_geo,
                 )
                 if failed:
                     failed_chat_ids.append(chat_id)
@@ -180,15 +190,37 @@ def build_routes(
     return routes
 
 
+async def _lookup_ip_geo(
+    repository: Repository,
+    ip_client: IpInfoLookup | None,
+    event: MastodonWebhook,
+) -> str:
+    """Best-effort geolocation text for pending registrations; '' when not available."""
+    if ip_client is None or not await repository.get_ip_lookup_enabled():
+        return ""
+    if event.event != "account.created" or not is_pending_local_account(event.object):
+        return ""
+    raw_ip = event.object.get("ip")
+    if not isinstance(raw_ip, str) or not raw_ip.strip():
+        return ""
+    try:
+        info = await ip_client.lookup(raw_ip)
+    except Exception:
+        logger.warning("IP lookup failed unexpectedly", exc_info=True)
+        return ""
+    return info.location_text()
+
+
 async def _maybe_build_autoban_info(
     repository: Repository,
     event: Any,
     object_id: str,
     settings: Settings,
+    ip_geo: str = "",
 ) -> AutobanInfo | None:
     if event.event != "account.created" or not is_pending_local_account(event.object):
         return None
-    snapshot = snapshot_account(event.object)
+    snapshot = snapshot_account(event.object, ip_geo)
     match = await find_match(repository, event.object)
     matched_rule_type: str | None = None
     matched_pattern: str | None = None
@@ -226,8 +258,9 @@ async def _send_event_message(
     obj: dict[str, Any],
     mastodon_origin: str,
     autoban: AutobanInfo | None = None,
+    ip_geo: str = "",
 ) -> Any:
-    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban)
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban, ip_geo)
     return await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -250,6 +283,7 @@ async def _deliver_event_to_chat(
     obj: dict[str, Any],
     mastodon_origin: str,
     autoban: AutobanInfo | None = None,
+    ip_geo: str = "",
 ) -> bool:
     lock_key = _webhook_lock_key(object_type, object_id, chat_id)
     try:
@@ -273,6 +307,7 @@ async def _deliver_event_to_chat(
                     obj=obj,
                     mastodon_origin=mastodon_origin,
                     autoban=autoban,
+                    ip_geo=ip_geo,
                 )
                 await repository.upsert_message_mapping(
                     object_type=object_type,
@@ -290,6 +325,7 @@ async def _deliver_event_to_chat(
                         obj=obj,
                         mastodon_origin=mastodon_origin,
                         autoban=autoban,
+                        ip_geo=ip_geo,
                     )
                 except TelegramAPIError as exc:
                     if not _is_message_not_found(exc):
@@ -312,6 +348,7 @@ async def _deliver_event_to_chat(
                         obj=obj,
                         mastodon_origin=mastodon_origin,
                         autoban=autoban,
+                        ip_geo=ip_geo,
                     )
                     await repository.upsert_message_mapping(
                         object_type=object_type,
@@ -354,8 +391,9 @@ async def _edit_event_message(
     obj: dict[str, Any],
     mastodon_origin: str,
     autoban: AutobanInfo | None = None,
+    ip_geo: str = "",
 ) -> Any:
-    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban)
+    text, keyboard = _render_event_message(event_name, obj, mastodon_origin, autoban, ip_geo)
     return await bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
@@ -371,11 +409,18 @@ def _render_event_message(
     obj: dict[str, Any],
     mastodon_origin: str,
     autoban: AutobanInfo | None = None,
+    ip_geo: str = "",
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     if event_name == "account.created":
-        text = render_account_event(event_name, obj)
         account_id = str(obj.get("id"))
         url = f"{mastodon_origin}/admin/accounts/{account_id}" if account_id else None
+        auto_banned = (
+            autoban is not None
+            and autoban.matched_rule_type is not None
+            and autoban.matched_pattern is not None
+            and autoban.auto_reject_at is not None
+        )
+        text = render_account_event(event_name, obj, auto_banned=auto_banned, ip_geo=ip_geo)
         if is_pending_local_account(obj):
             keyboard: InlineKeyboardMarkup | None
             if (

@@ -61,3 +61,21 @@ def test_data_retention_defaults_and_validates_positive_days() -> None:
     assert make_settings(DATA_RETENTION_DAYS=90).data_retention_days == 90
     with pytest.raises(ValueError):
         make_settings(DATA_RETENTION_DAYS=0)
+
+
+def test_ip_lookup_prefix_lengths_default_and_validate_ranges() -> None:
+    settings = make_settings()
+    assert settings.ip_lookup_ipv4_prefix_length == 24
+    assert settings.ip_lookup_ipv6_prefix_length == 80
+
+    configured = make_settings(
+        IP_LOOKUP_IPV4_PREFIX_LENGTH=20,
+        IP_LOOKUP_IPV6_PREFIX_LENGTH=64,
+    )
+    assert configured.ip_lookup_ipv4_prefix_length == 20
+    assert configured.ip_lookup_ipv6_prefix_length == 64
+
+    with pytest.raises(ValueError):
+        make_settings(IP_LOOKUP_IPV4_PREFIX_LENGTH=33)
+    with pytest.raises(ValueError):
+        make_settings(IP_LOOKUP_IPV6_PREFIX_LENGTH=129)

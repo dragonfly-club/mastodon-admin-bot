@@ -10,14 +10,20 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 
-from mastodon_admin_bot.autoban import snapshot_from_json
+from mastodon_admin_bot.autoban import record_used_reason_for_account, snapshot_from_json
 from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.storage.models import ModerationOperation, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository
-from mastodon_admin_bot.telegram.keyboards import open_keyboard, post_rejection_keyboard
-from mastodon_admin_bot.telegram.render import render_account_event
+from mastodon_admin_bot.telegram.keyboards import (
+    applied_block_actions,
+    open_keyboard,
+    post_rejection_keyboard,
+)
+from mastodon_admin_bot.telegram.render import account_from_snapshot, render_account_event
 
 logger = logging.getLogger(__name__)
+_UNCERTAIN_RECONCILIATION_DELAY = timedelta(seconds=5)
+_PROCESSING_OPERATION_LEASE = timedelta(seconds=60)
 
 
 async def auto_reject_due_accounts(
@@ -142,6 +148,9 @@ async def _auto_reject_one(
         pending_state="auto_rejected",
         handled_by=f"auto ({username})",
     )
+    operation = await repository.get_moderation_operation(operation_key)
+    if operation is not None:
+        await _record_used_reason_for_operation(repository, operation)
     await _update_messages_after_auto_reject(
         bot=bot,
         repository=repository,
@@ -159,8 +168,11 @@ async def reconcile_uncertain_operations(
     mastodon_origin: str,
     trusted_telegram_user_ids: set[int],
 ) -> int:
-    cutoff = datetime.now(UTC) - timedelta(seconds=5)
-    operations = await repository.list_uncertain_moderation_operations(older_than=cutoff)
+    now = datetime.now(UTC)
+    operations = await repository.list_reconcilable_moderation_operations(
+        uncertain_older_than=now - _UNCERTAIN_RECONCILIATION_DELAY,
+        processing_older_than=now - _PROCESSING_OPERATION_LEASE,
+    )
     reconciled = 0
     for operation in operations:
         if (
@@ -190,6 +202,7 @@ async def reconcile_uncertain_operations(
                     operation.object_id,
                     operation.action,
                 )
+                await _record_used_reason_for_operation(repository, operation)
                 reconciled += 1
             elif exc.status_code == 404:
                 await repository.complete_moderation_operation(
@@ -291,6 +304,22 @@ def _reconciled_pending_state(action: str) -> str | None:
     return None
 
 
+async def _record_used_reason_for_operation(
+    repository: Repository,
+    operation: ModerationOperation,
+) -> None:
+    if not await repository.get_record_used_reasons_enabled():
+        return
+    try:
+        await record_used_reason_for_account(
+            repository, operation.object_id, operation.requested_by
+        )
+    except Exception:
+        logger.exception(
+            "Failed to record used reason", extra={"account_id": operation.object_id}
+        )
+
+
 async def _retry_delay(repository: Repository, operation_key: str) -> timedelta:
     operation = await repository.get_moderation_operation(operation_key)
     attempts = operation.attempts if operation is not None else 1
@@ -307,10 +336,13 @@ async def _update_messages_after_reconciliation(
 ) -> None:
     if object_type == "account" and action in {"an", "rn"}:
         pending = await repository.get_pending_account(object_id)
-        include_reason = False
-        if pending is not None:
-            include_reason = bool(snapshot_from_json(pending.account_snapshot).get("reason"))
-        keyboard = post_rejection_keyboard(object_id, include_reason=include_reason)
+        snapshot = snapshot_from_json(pending.account_snapshot) if pending is not None else {}
+        include_reason = bool(snapshot.get("reason"))
+        keyboard = post_rejection_keyboard(
+            object_id,
+            include_reason=include_reason,
+            exclude=await applied_block_actions(repository, snapshot),
+        )
     else:
         page = "accounts" if object_type == "account" else "reports"
         keyboard = open_keyboard(f"{mastodon_origin.rstrip('/')}/admin/{page}/{object_id}")
@@ -334,20 +366,7 @@ async def _update_messages_after_reconciliation(
 def _rejected_account_from_snapshot(pending: PendingAccount) -> dict[str, Any]:
     # The Mastodon reject API response does not reliably include the account's
     # display fields, so render the updated message from the stored snapshot.
-    snapshot = snapshot_from_json(pending.account_snapshot)
-    account: dict[str, Any] = {}
-    acct = snapshot.get("acct", "")
-    if acct:
-        account = {"acct": acct}
-    return {
-        "id": pending.account_id,
-        "approved": False,
-        "email": snapshot.get("email", ""),
-        "ip": snapshot.get("ip", ""),
-        "locale": snapshot.get("locale", ""),
-        "account": account,
-        "invite_request": snapshot.get("reason", ""),
-    }
+    return account_from_snapshot(snapshot_from_json(pending.account_snapshot), approved=False)
 
 
 async def _update_messages_after_auto_reject(
@@ -360,7 +379,11 @@ async def _update_messages_after_auto_reject(
 ) -> None:
     snapshot = snapshot_from_json(pending.account_snapshot)
     include_reason = bool(snapshot.get("reason"))
-    keyboard = post_rejection_keyboard(pending.account_id, include_reason=include_reason)
+    keyboard = post_rejection_keyboard(
+        pending.account_id,
+        include_reason=include_reason,
+        exclude=await applied_block_actions(repository, snapshot),
+    )
     suffix = f"\n\nAuto-rejected by bot ({escape(username)})"
     mappings = await repository.get_message_mappings(
         object_type="account", object_id=pending.account_id
@@ -368,7 +391,15 @@ async def _update_messages_after_auto_reject(
     for mapping in mappings:
         try:
             if rejected_account is not None:
-                text = render_account_event("account.rejected", rejected_account) + suffix
+                text = (
+                    render_account_event(
+                        "account.rejected",
+                        rejected_account,
+                        auto_rejected=True,
+                        ip_geo=snapshot.get("ip_geo", ""),
+                    )
+                    + suffix
+                )
                 await bot.edit_message_text(
                     chat_id=mapping.chat_id,
                     message_id=mapping.message_id,

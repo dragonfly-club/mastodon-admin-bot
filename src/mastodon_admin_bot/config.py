@@ -53,6 +53,18 @@ class Settings(BaseSettings):
         alias="AUTOBAN_DEFAULT_REJECT_AFTER_SECONDS",
     )
     data_retention_days: int = Field(default=30, ge=1, alias="DATA_RETENTION_DAYS")
+    ip_lookup_ipv4_prefix_length: int = Field(
+        default=24,
+        ge=0,
+        le=32,
+        alias="IP_LOOKUP_IPV4_PREFIX_LENGTH",
+    )
+    ip_lookup_ipv6_prefix_length: int = Field(
+        default=80,
+        ge=0,
+        le=128,
+        alias="IP_LOOKUP_IPV6_PREFIX_LENGTH",
+    )
 
     @field_validator(
         "trusted_telegram_user_ids",

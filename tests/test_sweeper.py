@@ -7,12 +7,14 @@ import httpx
 from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from mastodon_admin_bot.autoban import RULE_TYPE_USED_REASON, used_reason_pattern
 from mastodon_admin_bot.mastodon.client import MastodonApiError
 from mastodon_admin_bot.security import TokenCipher
 from mastodon_admin_bot.storage.models import ModerationOperation, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository, create_engine
 from mastodon_admin_bot.sweeper import (
     _auto_reject_one,
+    _record_used_reason_for_operation,
     auto_reject_due_accounts,
     reconcile_uncertain_operations,
 )
@@ -182,6 +184,7 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
     assert refreshed.handled_by is not None
     assert "alice" in refreshed.handled_by
     assert len(bot.edited_text) == 1
+    assert "\U0001f916 Auto-rejected account" in bot.edited_text[0]["text"]
     assert "Auto-rejected by bot (alice)" in bot.edited_text[0]["text"]
     assert "spam@evil.example" in bot.edited_text[0]["text"]
     assert "@spam" in bot.edited_text[0]["text"]
@@ -189,7 +192,9 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
     assert "unknown" not in bot.edited_text[0]["text"]
     markup = bot.edited_text[0]["reply_markup"]
     texts = [b.text for row in markup.inline_keyboard for b in row]
-    assert texts == ["Block Email", "Block Domain", "Block Reason"]
+    assert texts == ["Block Email", "Block Domain"]
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert [rule.pattern for rule in rules] == [used_reason_pattern("buy crypto")]
     await engine.dispose()
 
 
@@ -335,6 +340,8 @@ async def test_reconciliation_confirms_missing_account_was_rejected(monkeypatch:
     pending = await repo.get_pending_account("1")
     assert pending is not None and pending.state == "auto_rejected"
     assert len(bot.edited_markup) == 1
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert [rule.pattern for rule in rules] == [used_reason_pattern("buy crypto")]
     await engine.dispose()
 
 
@@ -432,4 +439,81 @@ async def test_stored_timeout_shortening_makes_old_account_due(monkeypatch: Any)
     refreshed = await repo.get_pending_account("1")
     assert refreshed is not None
     assert refreshed.state == "auto_rejected"
+    await engine.dispose()
+
+
+async def test_reconciliation_manual_reject_records_used_reason(monkeypatch: Any) -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await _seed_moderator(repo)
+    await _seed_pending(repo, account_id="1")
+    await repo.upsert_message_mapping(
+        object_type="account", object_id="1", chat_id=10, message_id=100
+    )
+    await repo.claim_moderation_operation(
+        operation_key="account_decision:1",
+        action="an",
+        object_type="account",
+        object_id="1",
+        target_id=None,
+        requested_by=111,
+        handled_by="alice",
+    )
+    await repo.fail_moderation_operation(
+        "account_decision:1", error="ambiguous", uncertain=True
+    )
+    async with repo.sessionmaker() as session:
+        operation = await session.get(ModerationOperation, "account_decision:1")
+        assert operation is not None
+        operation.updated_at = datetime.now(UTC) - timedelta(minutes=1)
+        await session.commit()
+    _patch_mastodon_client(
+        monkeypatch, reject_error=MastodonApiError(404, "Record not found")
+    )
+    bot = FakeBot()
+
+    reconciled = await reconcile_uncertain_operations(
+        repository=repo,
+        bot=cast(Any, bot),
+        mastodon_origin="https://m.example",
+        trusted_telegram_user_ids={111},
+    )
+
+    assert reconciled == 1
+    rules = await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)
+    assert len(rules) == 1
+    assert rules[0].pattern == used_reason_pattern("buy crypto")
+    assert rules[0].created_by == 111
+    await engine.dispose()
+
+
+async def test_record_used_reason_for_operation_respects_flag() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    await repo.upsert_pending_account(
+        account_id="1", account_snapshot='{"reason": "buy crypto"}'
+    )
+    async with repo.sessionmaker() as session:
+        session.add(
+            ModerationOperation(
+                operation_key="account_decision:1",
+                action="an",
+                object_type="account",
+                object_id="1",
+                requested_by=111,
+                handled_by="alice",
+                status="failed",
+            )
+        )
+        await session.commit()
+    operation = await repo.get_moderation_operation("account_decision:1")
+    assert operation is not None
+
+    await repo.set_record_used_reasons_enabled(False)
+    await _record_used_reason_for_operation(repo, operation)
+    assert await repo.list_blocklist_rules(RULE_TYPE_USED_REASON) == []
+
+    await repo.set_record_used_reasons_enabled(True)
+    await _record_used_reason_for_operation(repo, operation)
+    assert len(await repo.list_blocklist_rules(RULE_TYPE_USED_REASON)) == 1
     await engine.dispose()
