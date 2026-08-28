@@ -23,6 +23,7 @@ from mastodon_admin_bot.autoban import (
     RULE_TYPE_USED_REASON,
     compile_rule_pattern,
     record_used_reason_for_account,
+    render_match_line,
     snapshot_from_json,
     used_reason_display,
     used_reason_pattern,
@@ -660,11 +661,14 @@ def _account_result_text(
             Action.APPROVE_ACCOUNT,
             Action.FORCE_APPROVE_ACCOUNT,
         )
-        return render_account_event(
+        text = render_account_event(
             _account_result_event(callback_data.action),
             account_from_snapshot(snapshot, approved=approved),
             ip_geo=snapshot.get("ip_geo", ""),
         )
+        if pending.matched_rule_type is not None and pending.matched_pattern is not None:
+            text += "\n" + render_match_line(pending.matched_rule_type, pending.matched_pattern)
+        return text
     if isinstance(api_result, dict) and api_result:
         return render_account_event(_account_result_event(callback_data.action), api_result)
     return None

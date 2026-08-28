@@ -10,7 +10,11 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 
-from mastodon_admin_bot.autoban import record_used_reason_for_account, snapshot_from_json
+from mastodon_admin_bot.autoban import (
+    record_used_reason_for_account,
+    render_match_line,
+    snapshot_from_json,
+)
 from mastodon_admin_bot.mastodon.client import MastodonApiError, MastodonClient
 from mastodon_admin_bot.storage.models import ModerationOperation, PendingAccount
 from mastodon_admin_bot.storage.repository import Repository
@@ -388,6 +392,13 @@ async def _update_messages_after_auto_reject(
     mappings = await repository.get_message_mappings(
         object_type="account", object_id=pending.account_id
     )
+    if (
+        pending.matched_rule_type is not None
+        and pending.matched_pattern is not None
+    ):
+        match_line = "\n" + render_match_line(pending.matched_rule_type, pending.matched_pattern)
+    else:
+        match_line = ""
     for mapping in mappings:
         try:
             if rejected_account is not None:
@@ -398,6 +409,7 @@ async def _update_messages_after_auto_reject(
                         auto_rejected=True,
                         ip_geo=snapshot.get("ip_geo", ""),
                     )
+                    + match_line
                     + suffix
                 )
                 await bot.edit_message_text(

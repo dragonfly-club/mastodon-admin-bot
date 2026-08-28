@@ -59,7 +59,9 @@ async def applied_block_actions(
     snapshot. A button stays hidden as long as its rule exists, so re-rendering
     the keyboard after any block action removes every button that has already
     been used, not just the one just clicked. The reason button also counts as
-    applied when the exact invite reason was already recorded as a used reason.
+    applied when the exact invite reason was already recorded as a used reason,
+    and the email button counts as applied when the account's email domain is
+    already blocked, since the domain rule covers the email.
     """
     rules = await repository.list_blocklist_rules()
     existing = {(rule.rule_type, rule.pattern) for rule in rules}
@@ -70,6 +72,13 @@ async def applied_block_actions(
             continue
         if (BLOCK_ACTION_TO_RULE_TYPE[action], block_rule_pattern(value)) in existing:
             applied.add(action)
+            continue
+        if action is Action.BLOCK_EMAIL:
+            # A blocked email domain already covers this account's email, so
+            # suggesting an email-level rule would be redundant.
+            domain = snapshot.get("email_domain", "")
+            if domain and (RULE_TYPE_EMAIL_DOMAIN, block_rule_pattern(domain)) in existing:
+                applied.add(Action.BLOCK_EMAIL)
     reason = snapshot.get("reason", "").strip()
     if reason and (RULE_TYPE_USED_REASON, used_reason_pattern(reason)) in existing:
         applied.add(Action.BLOCK_REASON)

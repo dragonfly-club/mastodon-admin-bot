@@ -294,6 +294,27 @@ async def test_post_action_markup_reject_hides_applied_block_buttons() -> None:
     await engine.dispose()
 
 
+async def test_post_action_markup_reject_hides_email_when_domain_blocked() -> None:
+    repo, engine = make_repo("sqlite+aiosqlite:///:memory:")
+    await repo.create_schema(engine)
+    snapshot = {"email": "a@x.com", "email_domain": "x.com", "reason": "spam"}
+    await repo.add_blocklist_rule(
+        rule_type="email_domain", pattern=_pattern("x.com"), created_by=1
+    )
+
+    callback = AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="999")
+    markup = _post_action_markup(
+        "https://mastodon.example",
+        callback,
+        include_reason=True,
+        exclude=await applied_block_actions(repo, snapshot),
+    )
+
+    assert markup is not None
+    assert _block_button_texts(markup) == ["Block Reason"]
+    await engine.dispose()
+
+
 def test_snapshot_has_reason_reads_pending_account_snapshot() -> None:
     with_reason = PendingAccount(account_id="1", account_snapshot='{"reason":"hi"}')
     without_reason = PendingAccount(account_id="2", account_snapshot='{"reason":""}')
@@ -358,6 +379,51 @@ def test_action_result_text_force_approve_renders_approved_account() -> None:
     assert "Handled by mod: Force approved account" in text
 
 
+def test_action_result_text_includes_autoban_match_line() -> None:
+    pending = PendingAccount(
+        account_id="123",
+        account_snapshot=(
+            '{'
+            '"acct":"spam","email":"spam@evil.example",'
+            '"ip":"192.0.2.1","locale":"en","reason":"buy crypto"'
+            "}"
+        ),
+        matched_rule_type="email",
+        matched_pattern="spam@",
+    )
+    text = _action_result_text(
+        current_text="old account text",
+        callback_data=AdminCallback(action=Action.REJECT_NOW_ACCOUNT, object_id="123"),
+        api_result={},
+        mastodon_username="mod",
+        pending=pending,
+    )
+    assert "Rejected account" in text
+    assert "Autoban: email pattern <code>spam@</code> matched" in text
+    assert "Handled by mod: Rejected account" in text
+
+
+def test_action_result_text_omits_match_line_without_match() -> None:
+    pending = PendingAccount(
+        account_id="123",
+        account_snapshot=(
+            '{'
+            '"acct":"spam","email":"spam@evil.example",'
+            '"ip":"192.0.2.1","locale":"en"'
+            "}"
+        ),
+    )
+    text = _action_result_text(
+        current_text="old account text",
+        callback_data=AdminCallback(action=Action.FORCE_APPROVE_ACCOUNT, object_id="123"),
+        api_result={},
+        mastodon_username="mod",
+        pending=pending,
+    )
+    assert "Approved account" in text
+    assert "Autoban:" not in text
+
+
 def _snapshot() -> dict[str, str]:
     return {"id": "999", "email": "a@x.com", "email_domain": "x.com", "reason": "spam"}
 
@@ -397,6 +463,16 @@ async def test_applied_block_actions_tracks_existing_rules() -> None:
         rule_type="email_domain", pattern=_pattern("other.com"), created_by=1
     )
     assert await applied_block_actions(repo, snapshot) == {Action.BLOCK_REASON, Action.BLOCK_EMAIL}
+
+    # A blocked email domain already covers this account's email.
+    await repo.add_blocklist_rule(
+        rule_type="email_domain", pattern=_pattern("x.com"), created_by=1
+    )
+    assert await applied_block_actions(repo, snapshot) == {
+        Action.BLOCK_REASON,
+        Action.BLOCK_EMAIL,
+        Action.BLOCK_EMAIL_DOMAIN,
+    }
 
     await engine.dispose()
 

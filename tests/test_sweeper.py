@@ -185,6 +185,7 @@ async def test_auto_reject_due_accounts_rejects_and_updates_messages(
     assert "alice" in refreshed.handled_by
     assert len(bot.edited_text) == 1
     assert "\U0001f916 Auto-rejected account" in bot.edited_text[0]["text"]
+    assert "Autoban: email pattern <code>spam@</code> matched" in bot.edited_text[0]["text"]
     assert "Auto-rejected by bot (alice)" in bot.edited_text[0]["text"]
     assert "spam@evil.example" in bot.edited_text[0]["text"]
     assert "@spam" in bot.edited_text[0]["text"]
